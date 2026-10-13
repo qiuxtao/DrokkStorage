@@ -4,6 +4,7 @@
     <AssemblyName>DrokkStorage</AssemblyName>
     <RootNamespace>DrokkStorage</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

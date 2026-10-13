@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <GamePath Condition="'$(GamePath)' == ''">$(MSBuildThisFileDirectory)../../game</GamePath>
+    <ModPath Condition="'$(ModPath)' == ''">$(MSBuildThisFileDirectory)../../bin/Release/DrokkStorage.dll</ModPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(GamePath)/7DaysToDie_Data/Managed/Assembly-CSharp.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GamePath)/7DaysToDie_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="DrokkStorage">
+      <HintPath>$(ModPath)</HintPath>
+    </Reference>
+    <PackageReference Include="HarmonyX" Version="2.13.0" />
+    <AssemblyMetadata Include="GamePath" Value="$(GamePath)" />
+    <AssemblyMetadata Include="ModPath" Value="$(ModPath)" />
+  </ItemGroup>
+  <Target Name="CheckGameAssemblies" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(GamePath)/7DaysToDie_Data/Managed/Assembly-CSharp.dll')"
+           Text="Set GamePath to a game install containing 7DaysToDie_Data/Managed/Assembly-CSharp.dll." />
+    <Error Condition="!Exists('$(ModPath)')"
+           Text="Build DrokkStorage.csproj in Release first, or set ModPath to the DLL to test." />
+  </Target>
+</Project>

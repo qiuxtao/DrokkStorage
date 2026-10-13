@@ -381,19 +381,19 @@ public static class DrokkStoragePatches
     // both on the same build?" in one grep instead of a second test round.
     public static void VerifyWorkstationPatches()
     {
-        // readItemStackArray is overloaded, so it has to be looked up by signature - a bare name
-        // lookup is ambiguous and would report a false failure.
         var expected = new (string Name, MethodBase Target)[]
         {
             ("TileEntity.IsSharedLock", AccessTools.Method(typeof(TileEntity), nameof(TileEntity.IsSharedLock))),
             ("TileEntityWorkstation.read", AccessTools.Method(typeof(TileEntityWorkstation), nameof(TileEntityWorkstation.read))),
-            ("TileEntityWorkstation.readItemStackArray", AccessTools.Method(typeof(TileEntityWorkstation),
-                nameof(TileEntityWorkstation.readItemStackArray), new Type[] { typeof(BinaryReader), typeof(ItemStack[]).MakeByRefType() })),
+            ("TileEntityWorkstation.UpdateTick", AccessTools.Method(typeof(TileEntityWorkstation), nameof(TileEntityWorkstation.UpdateTick))),
             ("XUiC_WorkstationWindowGroup.OnOpen", AccessTools.Method(typeof(XUiC_WorkstationWindowGroup), nameof(XUiC_WorkstationWindowGroup.OnOpen))),
             ("XUiC_WorkstationWindowGroup.OnClose", AccessTools.Method(typeof(XUiC_WorkstationWindowGroup), nameof(XUiC_WorkstationWindowGroup.OnClose))),
+            ("XUiC_WorkstationWindowGroup.syncTEfromUI", AccessTools.Method(typeof(XUiC_WorkstationWindowGroup), "syncTEfromUI")),
             ("XUiM_Workstation.SetRecipeQueueItems", AccessTools.Method(typeof(XUiM_Workstation), nameof(XUiM_Workstation.SetRecipeQueueItems))),
             ("TileEntityWorkstation.HandleRecipeQueue", AccessTools.Method(typeof(TileEntityWorkstation), "HandleRecipeQueue")),
             ("XUiC_RecipeStack.outputStack", AccessTools.Method(typeof(XUiC_RecipeStack), "outputStack")),
+            ("XUiC_RecipeStack.Update", AccessTools.Method(typeof(XUiC_RecipeStack), nameof(XUiC_RecipeStack.Update))),
+            ("XUiC_WorkstationFuelGrid.Update", AccessTools.Method(typeof(XUiC_WorkstationFuelGrid), nameof(XUiC_WorkstationFuelGrid.Update))),
             ("XUiC_RecipeStack.HandleOnPress", AccessTools.Method(typeof(XUiC_RecipeStack), "HandleOnPress")),
             ("XUiC_CraftingQueue.AddRecipeToCraft", AccessTools.Method(typeof(XUiC_CraftingQueue), nameof(XUiC_CraftingQueue.AddRecipeToCraft))),
             ("XUiC_CraftingQueue.AddItemToRepair", AccessTools.Method(typeof(XUiC_CraftingQueue), nameof(XUiC_CraftingQueue.AddItemToRepair))),
@@ -408,7 +408,7 @@ public static class DrokkStoragePatches
         }
 
         if (missing == null)
-            Log.Out($" [DrokkStorage] Workstation multi-viewer ACTIVE ({expected.Length}/{expected.Length} patches, live output sync).");
+            Log.Out($" [DrokkStorage] Workstation multi-viewer ACTIVE ({expected.Length}/{expected.Length} patches, server-authoritative workstation sync).");
         else
             Log.Warning($" [DrokkStorage] Workstation multi-viewer INCOMPLETE - not patched: {string.Join(", ", missing)}");
     }
@@ -461,8 +461,8 @@ public static class DrokkStoragePatches
     // XUiC_WorkstationGrid.UpdateBackend -> XUiM_Workstation.SetXStacks -> TileEntityWorkstation's
     // Input/Output/Tools/Fuel setter -> setModified(), which sends the TE to the server, and
     // NetPackageTileEntity.ProcessPackage rebroadcasts it to every client in range. Unlike
-    // TEFeatureStorage, TileEntityWorkstation.read does NOT gate the item arrays behind
-    // bUserAccessing (only the burn/tick state), so an open window still receives fresh arrays.
+    // TEFeatureStorage, TileEntityWorkstation.read gates both item arrays and simulation state
+    // behind bUserAccessing. The read patch below lets shared viewers accept these updates.
     //
     // What's missing is purely UI-side: XUiC_ItemStackGrid.SetStacks hands the slot controllers
     // *clones*, and XUiC_WorkstationWindowGroup.OnOpen only ever subscribes FuelChanged and
@@ -471,29 +471,28 @@ public static class DrokkStoragePatches
     // grids show whatever they were handed at open time until the window closes.
     //
     // We close that gap by re-seeding all four grids from the TE whenever an incoming packet
-    // lands on the workstation the local window has open. This is also what keeps the wholesale
-    // OnClose -> syncTEfromUI write honest: the grids it reads back are current instead of
-    // minutes-stale clones (see the "never pull from an open workstation" gotcha in AGENTS.md).
+    // lands on the workstation the local window has open. Closing a shared window must not
+    // write that snapshot back: even a recently refreshed client can be one packet behind.
     public static class WorkstationLiveSync
     {
         // The workstation window group currently open on this client, if any. XUi is
         // single-window-group per player, so one slot is enough.
         private static XUiC_WorkstationWindowGroup openWindow;
+        public static XUiC_WorkstationWindowGroup ClosingWindow { get; set; }
 
         public static void WindowOpened(XUiC_WorkstationWindowGroup window)
         {
             openWindow = window;
             lastQueueSignature = null;
             lastLocalRefresh = 0f;
+            if (DrokkStorage.config.multiViewersEnabled && window.craftingQueue != null)
+                window.wasCrafting = window.craftingQueue.IsCrafting();
         }
 
         public static void WindowClosed(XUiC_WorkstationWindowGroup window)
         {
             if (openWindow == window) openWindow = null;
             lastQueueSignature = null;
-            // NOTE: the queue is NOT reset here. OnClose runs its own syncTEfromUI *after* this,
-            // and MergeWithTileEntity (which that write goes through) works off the tile entity
-            // plus the local player's entity id, neither of which needs the window.
         }
 
         private static float lastLocalRefresh = 0f;
@@ -567,6 +566,7 @@ public static class DrokkStoragePatches
             openWindow.TileEntity_InputChanged();
             openWindow.TileEntity_OutputChanged();
             openWindow.TileEntity_FuelChanged();
+            RefreshFuelControls(te);
             RefreshQueueFromTileEntity(te);
 
             if (dbg)
@@ -578,25 +578,37 @@ public static class DrokkStoragePatches
             }
         }
 
+        private static void RefreshFuelControls(TileEntityWorkstation te)
+        {
+            var fuel = openWindow.fuelWindow;
+            if (fuel == null) return;
+            // TurnOn/TurnOff write the entire TE back to the server. A received state change
+            // only updates the controls; it is not another player's button press.
+            fuel.isOn = te.IsBurning;
+            if (fuel.button?.ViewComponent is XUiV_Button button)
+                button.Enabled = te.BurnTimeLeft > 0f || fuel.hasAnyFuel();
+            if (fuel.onOffLabel?.ViewComponent is XUiV_Label label)
+                label.Text = fuel.isOn ? fuel.turnOff : fuel.turnOn;
+            if (fuel.flameIcon?.ViewComponent is XUiV_Sprite flame)
+                flame.Color = fuel.isOn ? fuel.flameOnColor : fuel.flameOffColor;
+        }
+
         // ---- Crafting queue -------------------------------------------------------------
         //
-        // Structural signature of the queue as last drawn. CraftingTimeLeft is deliberately NOT
-        // part of it: the local XUiC_RecipeStack keeps counting down every frame for a smooth
-        // timer, and rebuilding the row on every incoming packet (~2s, plus one per grid edit)
-        // would make it stutter. Only add / cancel / completion change the structure, and those
-        // are exactly the events another viewer needs to see.
+        // Rebuild rows only when membership changes. Every refresh also corrects clocks and
+        // pause state in place, including when this structural signature stays the same.
         private static string lastQueueSignature;
 
         // True while we are re-seeding the UI queue from the tile entity, so the OnOpen-shaped
         // rebuild below can be told apart from a real player action.
         public static bool IsRebuildingQueue { get; private set; }
 
-        // Set for the duration of an explicit queue-row cancel (HandleOnPress) so merge drops
-        // that identity even when another player queued it. Ownership merge otherwise restores
-        // foreign rows from the TE, which is what left the other viewer able to cancel too
-        // and double the ingredients.
+        // Scoped operation intent: a task add and an exact selected-slot cancellation.
+        private static int pendingAddSlot = -1;
+        private static int pendingCancelSlot = -1;
         private static string pendingCancelKey;
         private static int pendingCancelEntityId = int.MinValue;
+        private static int pendingCancelCount;
 
         private static readonly MethodInfo SyncTEfromUIMethod =
             AccessTools.Method(typeof(XUiC_WorkstationWindowGroup), "syncTEfromUI");
@@ -651,25 +663,57 @@ public static class DrokkStoragePatches
             return false;
         }
 
-        public static void BeginCancel(Recipe recipe, int startingEntityId)
+        public static void BeginAdd(int slot) { pendingAddSlot = slot; }
+        public static void EndAdd() { pendingAddSlot = -1; }
+
+        public static bool CanCancel(RecipeQueueItem[] queue, int slot, XUiC_RecipeStack row)
         {
+            if (queue == null || slot < 0 || slot >= queue.Length) return false;
+            var item = queue[slot];
+            return IsLive(item) && item.StartingEntityId == row.StartingEntityId
+                && RecipeKey(item) == RecipeKey(row.GetRecipe())
+                && item.Multiplier == row.GetRecipeCount() && item.Quality == row.OutputQuality;
+        }
+
+        public static void BeginCancel(int slot, Recipe recipe, int startingEntityId, int count)
+        {
+            pendingCancelSlot = slot;
             pendingCancelKey = RecipeKey(recipe);
             pendingCancelEntityId = startingEntityId;
+            pendingCancelCount = count;
         }
 
         public static void EndCancel()
         {
             pendingCancelKey = null;
             pendingCancelEntityId = int.MinValue;
+            pendingCancelSlot = -1;
         }
 
         public static void SyncQueueToTileEntity(XUiC_WorkstationWindowGroup window)
         {
             if (window == null || SyncTEfromUIMethod == null) return;
-            // Vanilla only calls syncTEfromUI when the crafting-slot IsCrafting edge flips
-            // (or on close). A second queued row, or a client add while the host is already
-            // crafting, never flips that edge - so the write never leaves the machine.
-            SyncTEfromUIMethod.Invoke(window, null);
+            if (!DrokkStorage.config.multiViewersEnabled)
+            {
+                SyncTEfromUIMethod.Invoke(window, null);
+                return;
+            }
+            // Genuine queue edits publish only the queue. Never copy unrelated UI grids back
+            // over newer server output/fuel/input just because a task was added or cancelled.
+            var rows = window.craftingQueue.GetRecipesToCraft();
+            var queue = rows.Select(row => new RecipeQueueItem
+            {
+                Recipe = row.GetRecipe(), Multiplier = (short)row.GetRecipeCount(),
+                CraftingTimeLeft = row.GetRecipeCraftingTimeLeft(), IsCrafting = row.IsCrafting,
+                Quality = (byte)row.OutputQuality, StartingEntityId = row.StartingEntityId,
+                OneItemCraftTime = row.GetOneItemCraftTime(), RepairItem = row.originalItem,
+                AmountToRepair = (ushort)row.amountToRepair
+            }).ToArray();
+            var te = window.WorkstationData.TileEntity;
+            if ((pendingAddSlot >= 0 && !te.hasRecipeInQueue()) || pendingCancelSlot == te.Queue.Length - 1)
+                te.ResetTickTime(); // New head starts now, not at the previous head's last tick.
+            window.WorkstationData.SetRecipeQueueItems(queue);
+            window.wasCrafting = window.craftingQueue.IsCrafting();
         }
 
         public static int LocalPlayerId()
@@ -690,8 +734,10 @@ public static class DrokkStoragePatches
             if (teQueue == null) return;
 
             string sig = QueueSignature(teQueue);
-            if (sig == lastQueueSignature) return;      // nothing structural changed
-            lastQueueSignature = sig;
+            if (sig == lastQueueSignature)
+            {
+                return;
+            }
 
             int slots = q.GetRecipesToCraft().Length;
             IsRebuildingQueue = true;
@@ -715,6 +761,10 @@ public static class DrokkStoragePatches
                 }
                 q.IsDirty = true;
                 openWindow.SetAllChildrenDirty();
+                // A server refresh must not look like a local IsCrafting edge in Update(),
+                // which would echo the whole workstation back and rewind server progress.
+                openWindow.wasCrafting = q.IsCrafting();
+                lastQueueSignature = sig;
             }
             finally { IsRebuildingQueue = false; }
 
@@ -722,104 +772,58 @@ public static class DrokkStoragePatches
                 Log.Out($"[DrokkStorage] WS queue REBUILT from TE: {sig}");
         }
 
-        // Fix 2. Replaces the wholesale queue write in syncTEfromUI.
-        //
-        // Vanilla hands SetRecipeQueueItems the local UI's entire queue, so with two viewers the
-        // second writer's array simply replaces the first's - their entries vanish from the tile
-        // entity even though their UI keeps counting them down locally. Ownership is already
-        // recorded per entry: XUiC_RecipeStack.SetRecipe stamps StartingEntityId with the queueing
-        // player's entity id. So a viewer may only speak for their own entries; everyone else's
-        // come back from the tile entity untouched, in their original slots (slot n-1 is the one
-        // actually being crafted, so moving a foreign entry would hijack someone else's craft).
-        //
-        // For local entries the tile entity already knows about we also take the TE's copy rather
-        // than the UI's, so the server's countdown is authoritative and a client's slightly-drifted
-        // local timer can never be written back over it.
-        //
-        // Cancel is the exception to foreign-keep: HandleOnPress refunds locally for whoever
-        // clicked, so if merge puts that row back the other viewer still sees it and can refund
-        // too. pendingCancelKey is the row that was just clicked; drop one matching TE entry
-        // even if StartingEntityId is someone else. Close / IsCrafting-edge writes leave the
-        // flag unset, so a stale UI still cannot wipe another player's newly queued craft.
+
+        // Queue changes are explicit operations. A recipe name cannot identify a task:
+        // two rows may craft the same recipe with completely different counts and clocks.
+        // Preserve every existing TE row; insert only the row created by this add operation
+        // or remove only the exact row selected by this cancellation.
         public static RecipeQueueItem[] MergeWithTileEntity(TileEntityWorkstation te, RecipeQueueItem[] uiQueue)
         {
-            RecipeQueueItem[] teQueue = te?.Queue;
-            if (teQueue == null || uiQueue == null || uiQueue.Length == 0) return uiQueue;
-            int me = LocalPlayerId();
-            if (me == -1) return uiQueue;                       // no local player - leave vanilla alone
-
-            int n = uiQueue.Length;
-            RecipeQueueItem[] result = new RecipeQueueItem[n];
-            bool cancelConsumed = pendingCancelKey == null;
-
-            // Other viewers' entries: keep the TE's copy in the TE's slot, unless this write is
-            // an explicit cancel of that exact row.
-            for (int i = 0; i < n && i < teQueue.Length; i++)
+            if (te?.Queue == null || uiQueue == null) return uiQueue;
+            var result = te.Queue.Select(CloneQueueItem).ToArray();
+            bool removed = false;
+            if (pendingCancelSlot >= 0 && pendingCancelSlot < result.Length)
             {
-                RecipeQueueItem it = teQueue[i];
-                if (!IsLive(it) || it.StartingEntityId == me) continue;
-                if (!cancelConsumed && RecipeKey(it) == pendingCancelKey && it.StartingEntityId == pendingCancelEntityId)
+                var item = result[pendingCancelSlot];
+                if (IsLive(item) && item.StartingEntityId == pendingCancelEntityId
+                    && RecipeKey(item) == pendingCancelKey && item.Multiplier == pendingCancelCount)
                 {
-                    cancelConsumed = true;
-                    if (DrokkStorage.config.isDebug)
-                        Log.Out($"[DrokkStorage] WS queue MERGE: dropping cancelled foreign {pendingCancelKey}@{pendingCancelEntityId} at slot {i}");
-                    continue;
-                }
-                result[i] = it;
-            }
-
-            List<RecipeQueueItem> teMine = new List<RecipeQueueItem>();
-            for (int i = 0; i < teQueue.Length; i++)
-            {
-                RecipeQueueItem it = teQueue[i];
-                if (IsLive(it) && it.StartingEntityId == me) teMine.Add(it);
-            }
-
-            // Walk the UI in slot order and decide, per local entry, whether it is one the TE
-            // already has (keep the TE's version - server progress wins) or one queued since the
-            // last refresh (keep the UI's - the TE has never seen it). Matching by recipe rather
-            // than by index because cycleRecipeQueue shifts entries toward the crafting slot as
-            // crafts finish, so indices are not stable between the two arrays.
-            List<RecipeQueueItem> keep = new List<RecipeQueueItem>();
-            for (int i = 0; i < n; i++)
-            {
-                RecipeQueueItem ui = uiQueue[i];
-                if (!IsLive(ui)) continue;
-                if (ui.StartingEntityId != me) continue;        // foreign - already taken from TE
-                int match = -1;
-                for (int j = 0; j < teMine.Count; j++)
-                {
-                    if (RecipeKey(teMine[j]) == RecipeKey(ui)) { match = j; break; }
-                }
-                if (match >= 0) { keep.Add(teMine[match]); teMine.RemoveAt(match); }
-                else keep.Add(ui);
-                // A TE entry of ours with no UI match is left in teMine and dropped: that is a
-                // cancel, and dropping it is the whole point of letting the local player speak.
-            }
-
-            // Pack into the free slots from the crafting end backwards, preserving the local
-            // ordering the player sees. AddRecipeToCraft fills the same way.
-            for (int k = keep.Count - 1; k >= 0; k--)
-            {
-                for (int slot = n - 1; slot >= 0; slot--)
-                {
-                    if (result[slot] == null) { result[slot] = keep[k]; break; }
+                    result[pendingCancelSlot] = new RecipeQueueItem();
+                    removed = true;
                 }
             }
-
-            for (int i = 0; i < n; i++)
+            if (removed || pendingAddSlot >= 0)
             {
-                if (result[i] == null) result[i] = new RecipeQueueItem();
-                result[i].IsCrafting = false;
+                // Close cancellation gaps before appending so a later add cannot jump ahead
+                // of older waiting tasks. Preserve every task's own count and clock.
+                var live = result.Where(IsLive).ToArray();
+                result = Enumerable.Range(0, result.Length).Select(_ => new RecipeQueueItem()).ToArray();
+                Array.Copy(live, 0, result, result.Length - live.Length, live.Length);
             }
-            if (IsLive(result[n - 1])) result[n - 1].IsCrafting = true;
-
-            if (DrokkStorage.config.isDebug)
-                Log.Out($"[DrokkStorage] WS queue MERGE (me={me}): ui={QueueSignature(uiQueue)} te={QueueSignature(teQueue)} -> {QueueSignature(result)}");
-
+            if (pendingAddSlot >= 0 && pendingAddSlot < uiQueue.Length && IsLive(uiQueue[pendingAddSlot]))
+            {
+                int free = Array.FindLastIndex(result, item => !IsLive(item));
+                if (free < 0) throw new InvalidOperationException("Workstation queue has no free slot for the new task.");
+                result[free] = CloneQueueItem(uiQueue[pendingAddSlot]);
+            }
+            for (int i = 0; i < result.Length; i++)
+                result[i].IsCrafting = i == result.Length - 1 && IsLive(result[i])
+                    && (!te.isModuleUsed[3] || te.IsBurning);
             return result;
         }
 
+        private static RecipeQueueItem CloneQueueItem(RecipeQueueItem item)
+        {
+            if (item == null) return new RecipeQueueItem();
+            return new RecipeQueueItem
+            {
+                Recipe = item.Recipe, Multiplier = item.Multiplier,
+                CraftingTimeLeft = item.CraftingTimeLeft, OneItemCraftTime = item.OneItemCraftTime,
+                IsCrafting = item.IsCrafting, Quality = item.Quality,
+                StartingEntityId = item.StartingEntityId,
+                RepairItem = item.RepairItem?.Clone(), AmountToRepair = item.AmountToRepair
+            };
+        }
         public static string Describe(ItemStack[] stacks)
         {
             if (stacks == null) return "null";
@@ -830,52 +834,6 @@ public static class DrokkStoragePatches
                 parts.Add($"{i}:{stacks[i].itemValue?.ItemClass?.GetItemName() ?? "?"}x{stacks[i].count}");
             }
             return parts.Count == 0 ? "empty" : string.Join(" ", parts);
-        }
-    }
-
-    // 1a-iii. THE ACTUAL BLOCKER for shared workstations.
-    //
-    // TileEntityWorkstation.read looks like it applies incoming item arrays unconditionally - the
-    // bUserAccessing checks in read() itself only guard the burn/tick state. The gate is one level
-    // down, inside the helper: readItemStackArray(_br, ref stack) parses the payload and then
-    // THROWS IT AWAY when bUserAccessing is true (TileEntityWorkstation.cs:1106). Every one of
-    // fuel/input/tools/output goes through that helper, so any machine with the window open
-    // silently ignores every incoming change to all four grids.
-    //
-    // That is what the first two-player test caught. The host had the workbench open, so the
-    // server discarded the client's write and kept its own 150 rounds; the client had it open, so
-    // it discarded the server's state too. Both sides kept their own copy and both could take the
-    // same stack - the duplication. Refreshing the UI could never have helped: the tile entity the
-    // UI reads from was never updated in the first place.
-    //
-    // So we bypass the gate the same way the mod already does for TEFeatureStorage.Read: clear
-    // bUserAccessing for the duration of the parse, then restore it. Patching the helper rather
-    // than read() keeps the bypass surgical - the burn-time and lastTickTime gating in read() is
-    // left exactly as vanilla has it, so an open window still owns its own crafting sim.
-    //
-    // The one case we must NOT bypass is a write of our own still in flight: the server echoes
-    // every client write back, and applying an echo that predates our edit rolls it back (see the
-    // matching guard in TEFeatureStorage_Read_Patch and the item-dupe in known_bugs.md). Note the
-    // sibling overload readItemStackArray(_br, ref stack, ref lastStack) already gates on exactly
-    // that condition instead of bUserAccessing - vanilla itself treats it as the correct test.
-    [HarmonyPatch(typeof(TileEntityWorkstation), nameof(TileEntityWorkstation.readItemStackArray),
-        new Type[] { typeof(BinaryReader), typeof(ItemStack[]) }, new ArgumentType[] { ArgumentType.Normal, ArgumentType.Ref })]
-    public static class TileEntityWorkstation_readItemStackArray_Patch
-    {
-        public static void Prefix(TileEntityWorkstation __instance, out bool __state)
-        {
-            __state = false;
-            if (!DrokkStorage.config.multiViewersEnabled) return;
-            if (!__instance.IsUserAccessing()) return;          // nothing to bypass
-            if (__instance.bWaitingForServerResponse) return;   // stale echo of our own write
-
-            __instance.SetUserAccessing(_bUserAccessing: false);
-            __state = true;
-        }
-
-        public static void Postfix(TileEntityWorkstation __instance, bool __state)
-        {
-            if (__state) __instance.SetUserAccessing(_bUserAccessing: true);
         }
     }
 
@@ -916,8 +874,23 @@ public static class DrokkStoragePatches
     [HarmonyPatch(typeof(TileEntityWorkstation), nameof(TileEntityWorkstation.read))]
     public static class TileEntityWorkstation_read_Patch
     {
-        public static void Postfix(TileEntityWorkstation __instance, TileEntity.StreamModeRead _eStreamMode)
+        public static void Prefix(TileEntityWorkstation __instance, TileEntity.StreamModeRead _eStreamMode, out bool __state)
         {
+            __state = false;
+            if (!DrokkStorage.config.multiViewersEnabled) return;
+            if (_eStreamMode == TileEntity.StreamModeRead.Persistency) return;
+            if (!__instance.IsUserAccessing() || __instance.bWaitingForServerResponse) return;
+
+            // Bypass the whole network read, not only readItemStackArray: the client must also
+            // accept the server's burn/melt times and clock, and SetDataFromNet must apply tools.
+            // Keep the pending-write guard so an older echo cannot restore a just-moved stack.
+            __instance.SetUserAccessing(_bUserAccessing: false);
+            __state = true;
+        }
+
+        public static void Postfix(TileEntityWorkstation __instance, TileEntity.StreamModeRead _eStreamMode, bool __state)
+        {
+            if (__state) __instance.SetUserAccessing(_bUserAccessing: true);
             if (DrokkStorage.config.isDebug)
                 Log.Out($"[DrokkStorage] WS READ-RAW {__instance.ToWorldPos()}: mode={_eStreamMode}, output=[{WorkstationLiveSync.Describe(__instance.Output)}], "
                     + $"queue=[{WorkstationLiveSync.DescribeQueue(__instance.Queue)}]");
@@ -931,6 +904,13 @@ public static class DrokkStoragePatches
             {
                 Log.Error($" [DrokkStorage] Workstation live refresh failed: {e}");
             }
+        }
+
+        public static void Finalizer(TileEntityWorkstation __instance, bool __state)
+        {
+            // Harmony postfixes do not run when read throws. Never leave an open workstation
+            // marked unattended after a failed packet; do not suppress the original exception.
+            if (__state) __instance.SetUserAccessing(_bUserAccessing: true);
         }
     }
 
@@ -952,27 +932,36 @@ public static class DrokkStoragePatches
         }
     }
 
-    // Fix 2 (patch half). Queue ownership - see WorkstationLiveSync.MergeWithTileEntity for the
-    // reasoning. syncTEfromUI is the only caller of SetRecipeQueueItems, and it always hands over
-    // the local UI's whole array, so rewriting the argument here is enough to turn that wholesale
-    // overwrite into a per-owner merge. Grids are unaffected - those stay wholesale writes, which
-    // is safe now that RefreshFromTileEntity keeps them current.
+    // Preserve server rows and apply only the explicit add/cancel operation currently in scope.
     [HarmonyPatch(typeof(XUiM_Workstation), nameof(XUiM_Workstation.SetRecipeQueueItems))]
     public static class XUiM_Workstation_SetRecipeQueueItems_Patch
     {
-        public static void Prefix(XUiM_Workstation __instance, ref RecipeQueueItem[] _queueStacks)
+        public static bool Prefix(XUiM_Workstation __instance, ref RecipeQueueItem[] _queueStacks)
         {
-            if (!DrokkStorage.config.multiViewersEnabled) return;
+            if (!DrokkStorage.config.multiViewersEnabled) return true;
             try
             {
                 _queueStacks = WorkstationLiveSync.MergeWithTileEntity(__instance.TileEntity, _queueStacks);
+                return true;
             }
             catch (Exception e)
             {
-                // Falling through with the unmerged array is vanilla behaviour (last writer wins),
-                // which is worse than the merge but never worse than crashing the close handler.
                 Log.Error($" [DrokkStorage] Workstation queue merge failed: {e}");
+                return false; // Never fall back to an unmerged snapshot that duplicates tasks.
             }
+        }
+    }
+
+    // The vanilla window calls UpdateTick on open and every 0.5s while burning, even on a
+    // remote client. With server-owned crafting that burns/melts locally and sends an old full
+    // TE snapshot back, overwriting the server's queue/output and repeatedly setting the
+    // pending-write guard. Only the server may simulate a shared workstation.
+    [HarmonyPatch(typeof(TileEntityWorkstation), nameof(TileEntityWorkstation.UpdateTick))]
+    public static class TileEntityWorkstation_UpdateTick_Patch
+    {
+        public static bool Prefix(World world)
+        {
+            return !DrokkStorage.config.multiViewersEnabled || !world.IsRemote();
         }
     }
 
@@ -985,9 +974,8 @@ public static class DrokkStoragePatches
     // simulation, which is how two players queueing one minibike each ended up with two bikes in
     // the output while each UI showed a single entry.
     //
-    // So on the server we run the tick regardless of who has the window open. Clients are left
-    // alone (their bUserAccessing still blocks it) and the client-side craft completion is
-    // suppressed separately below, leaving exactly one machine producing items.
+    // So on the server we run the tick regardless of who has the window open. Remote ticks and
+    // client-side craft completion are suppressed separately, leaving one item-producing machine.
     //
     // The clamp matters: TileEntityWorkstation.read(FromClient) rewrites lastTickTime from the
     // sending client's elapsed-tick count, so a client with a stale clock can hand the server a
@@ -1056,6 +1044,64 @@ public static class DrokkStoragePatches
         }
     }
 
+    [HarmonyPatch(typeof(XUiC_RecipeStack), nameof(XUiC_RecipeStack.Update))]
+    public static class XUiC_RecipeStack_Update_Patch
+    {
+        public static void Prefix(XUiC_RecipeStack __instance)
+        {
+            if (!DrokkStorage.config.multiViewersEnabled) return;
+            if (!(__instance.windowGroup?.Controller is XUiC_WorkstationWindowGroup window)) return;
+            var te = window.WorkstationData?.TileEntity;
+            var rows = window.craftingQueue?.GetRecipesToCraft();
+            var head = te?.Queue?.LastOrDefault();
+            // The vanilla queue controller resumes its head every frame, including after a
+            // fuel pause. Enforce server ownership before the row subtracts its display time.
+            __instance.IsCrafting = te != null && te.IsCrafting && head?.Recipe != null
+                && head.Multiplier > 0 && rows?.LastOrDefault() == __instance;
+            __instance.isInventoryFull = false;
+        }
+    }
+
+    [HarmonyPatch(typeof(XUiC_WorkstationFuelGrid), nameof(XUiC_WorkstationFuelGrid.Update))]
+    public static class XUiC_WorkstationFuelGrid_Update_Patch
+    {
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var codes = instructions.ToList();
+            var cycle = AccessTools.Method(typeof(XUiC_WorkstationFuelGrid), "CycleStacks");
+            var turnOff = AccessTools.Method(typeof(XUiC_WorkstationFuelGrid), nameof(XUiC_WorkstationFuelGrid.TurnOff));
+            int cycles = 0, stops = 0;
+            foreach (var code in codes)
+            {
+                if (code.Calls(cycle))
+                {
+                    code.opcode = OpCodes.Call;
+                    code.operand = AccessTools.Method(typeof(XUiC_WorkstationFuelGrid_Update_Patch), nameof(AutoCycle));
+                    cycles++;
+                }
+                else if (code.Calls(turnOff))
+                {
+                    code.opcode = OpCodes.Call;
+                    code.operand = AccessTools.Method(typeof(XUiC_WorkstationFuelGrid_Update_Patch), nameof(AutoTurnOff));
+                    stops++;
+                }
+            }
+            if (cycles != 1 || stops != 1)
+                throw new InvalidOperationException("Workstation fuel Update layout changed; automatic-write guard could not be applied.");
+            return codes;
+        }
+
+        public static void AutoCycle(XUiC_WorkstationFuelGrid grid)
+        {
+            if (!DrokkStorage.config.multiViewersEnabled) grid.CycleStacks();
+        }
+
+        public static void AutoTurnOff(XUiC_WorkstationFuelGrid grid)
+        {
+            if (!DrokkStorage.config.multiViewersEnabled) grid.TurnOff();
+        }
+    }
+
     // Cancel must write through immediately and be allowed to drop another viewer's row.
     // Vanilla HandleOnPress refunds locally then only syncs on the IsCrafting edge / close;
     // ownership merge then put foreign rows back, so the other player still saw the craft
@@ -1080,20 +1126,18 @@ public static class DrokkStoragePatches
 
             TileEntityWorkstation te = wg.WorkstationData?.TileEntity;
             int ownerId = __instance.StartingEntityId;
-            if (te != null && !WorkstationLiveSync.QueueHasLive(te.Queue, recipe, ownerId))
+            int slot = Array.IndexOf(wg.craftingQueue.GetRecipesToCraft(), __instance);
+            if (te != null && !WorkstationLiveSync.CanCancel(te.Queue, slot, __instance))
             {
                 // Another viewer already cancelled this row (TE is empty); this click is a
                 // stale UI slot. Clear it without refunding or we duplicate the ingredients.
                 if (DrokkStorage.config.isDebug)
                     Log.Out($"[DrokkStorage] WS queue CANCEL skipped refund: TE already missing {recipe.GetName()}@{ownerId}");
-                __instance.IsCrafting = false;
-                __instance.ClearRecipe();
-                __instance.Owner?.RefreshQueue();
-                wg.SetAllChildrenDirty();
+                WorkstationLiveSync.RefreshQueueFromTileEntity(te);
                 return false;
             }
 
-            WorkstationLiveSync.BeginCancel(recipe, ownerId);
+            WorkstationLiveSync.BeginCancel(slot, recipe, ownerId, __instance.GetRecipeCount());
             __state = true;
             if (DrokkStorage.config.isDebug)
                 Log.Out($"[DrokkStorage] WS queue CANCEL {recipe.GetName()}@{ownerId} me={WorkstationLiveSync.LocalPlayerId()}");
@@ -1112,6 +1156,11 @@ public static class DrokkStoragePatches
                 WorkstationLiveSync.EndCancel();
             }
         }
+
+        public static void Finalizer(bool __state)
+        {
+            if (__state) WorkstationLiveSync.EndCancel();
+        }
     }
 
     // Same hole as cancel: vanilla only writes the queue on the IsCrafting edge / close.
@@ -1122,7 +1171,21 @@ public static class DrokkStoragePatches
     [HarmonyPatch(typeof(XUiC_CraftingQueue), nameof(XUiC_CraftingQueue.AddRecipeToCraft))]
     public static class XUiC_CraftingQueue_AddRecipeToCraft_Patch
     {
-        public static void Postfix(XUiC_CraftingQueue __instance, Recipe _recipe, bool __result)
+        public static bool Prefix(XUiC_CraftingQueue __instance, ref bool __result, out bool[] __state)
+        {
+            __state = __instance.GetRecipesToCraft().Select(row => row.HasRecipe()).ToArray();
+            if (DrokkStorage.config.multiViewersEnabled && !WorkstationLiveSync.IsRebuildingQueue
+                && __instance.windowGroup?.Controller is XUiC_WorkstationWindowGroup window
+                && window.WorkstationData?.TileEntity?.Queue is RecipeQueueItem[] queue
+                && queue.All(item => item?.Recipe != null && item.Multiplier > 0))
+            {
+                __result = false;
+                return false;
+            }
+            return true;
+        }
+
+        public static void Postfix(XUiC_CraftingQueue __instance, Recipe _recipe, bool __result, bool[] __state)
         {
             if (!__result) return;
             if (!DrokkStorage.config.multiViewersEnabled) return;
@@ -1135,14 +1198,31 @@ public static class DrokkStoragePatches
                 try { name = _recipe?.GetName(); } catch { name = null; }
                 Log.Out($"[DrokkStorage] WS queue ADD {name ?? "?"} me={WorkstationLiveSync.LocalPlayerId()}");
             }
-            WorkstationLiveSync.SyncQueueToTileEntity(wg);
+            PublishAddedRow(__instance, wg, __state);
+        }
+
+        public static void PublishAddedRow(XUiC_CraftingQueue queue, XUiC_WorkstationWindowGroup window, bool[] before)
+        {
+            var rows = queue.GetRecipesToCraft();
+            int slot = -1;
+            for (int i = 0; i < rows.Length; i++)
+                if (!before[i] && rows[i].HasRecipe()) { slot = i; break; }
+            if (slot < 0) return;
+            WorkstationLiveSync.BeginAdd(slot);
+            try { WorkstationLiveSync.SyncQueueToTileEntity(window); }
+            finally { WorkstationLiveSync.EndAdd(); }
         }
     }
 
     [HarmonyPatch(typeof(XUiC_CraftingQueue), nameof(XUiC_CraftingQueue.AddItemToRepair))]
     public static class XUiC_CraftingQueue_AddItemToRepair_Patch
     {
-        public static void Postfix(XUiC_CraftingQueue __instance, bool __result)
+        public static bool Prefix(XUiC_CraftingQueue __instance, ref bool __result, out bool[] __state)
+        {
+            return XUiC_CraftingQueue_AddRecipeToCraft_Patch.Prefix(__instance, ref __result, out __state);
+        }
+
+        public static void Postfix(XUiC_CraftingQueue __instance, bool __result, bool[] __state)
         {
             if (!__result) return;
             if (!DrokkStorage.config.multiViewersEnabled) return;
@@ -1151,7 +1231,7 @@ public static class DrokkStoragePatches
 
             if (DrokkStorage.config.isDebug)
                 Log.Out($"[DrokkStorage] WS queue ADD-REPAIR me={WorkstationLiveSync.LocalPlayerId()}");
-            WorkstationLiveSync.SyncQueueToTileEntity(wg);
+            XUiC_CraftingQueue_AddRecipeToCraft_Patch.PublishAddedRow(__instance, wg, __state);
         }
     }
 
@@ -3394,14 +3474,33 @@ public static class DrokkStoragePatches
         }
     }
 
-    // Deregister before OnClose's syncTEfromUI runs, so a packet landing mid-close can't
-    // re-seed grids the window is in the middle of writing back.
+    // Slot edits and queue add/cancel operations already write through immediately. Closing a
+    // shared window must not send its last snapshot over a newer server completion, especially
+    // when the final output packet is still in flight. Keep the rest of vanilla close/unlock.
     [HarmonyPatch(typeof(XUiC_WorkstationWindowGroup), nameof(XUiC_WorkstationWindowGroup.OnClose))]
     public static class WorkstationWindowGroup_OnClose_Patch
     {
-        public static void Prefix(XUiC_WorkstationWindowGroup __instance)
+        public static void Prefix(XUiC_WorkstationWindowGroup __instance, out XUiC_WorkstationWindowGroup __state)
         {
+            __state = WorkstationLiveSync.ClosingWindow;
+            WorkstationLiveSync.ClosingWindow = __instance;
             WorkstationLiveSync.WindowClosed(__instance);
+        }
+
+        public static void Finalizer(XUiC_WorkstationWindowGroup __state)
+        {
+            WorkstationLiveSync.ClosingWindow = __state;
+        }
+    }
+
+    [HarmonyPatch(typeof(XUiC_WorkstationWindowGroup), "syncTEfromUI")]
+    public static class WorkstationWindowGroup_syncTEfromUI_Patch
+    {
+        public static bool Prefix(XUiC_WorkstationWindowGroup __instance)
+        {
+            // Slot edits write immediately; explicit queue operations publish the queue alone.
+            // Vanilla IsCrafting transitions and OnClose must never send a UI snapshot.
+            return !DrokkStorage.config.multiViewersEnabled;
         }
     }
 
