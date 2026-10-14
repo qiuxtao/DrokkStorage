@@ -10,7 +10,7 @@
 	     reloading and refueling. Default 15. -->
 	<ContainerRange value="15" />
 
-	<!-- Radius in blocks (applied to each axis) searched when Quick Stacking / Restocking
+	<!-- Radius in blocks (applied to each axis) searched when Quick Stacking
 	     into nearby containers. Default 15. -->
 	<QuickStackDistance value="15" />
 
@@ -34,13 +34,13 @@
 	     them to be unlocked to be auto-pulled from. Default true. -->
 	<AllowLockedContainers value="true" />
 
-	<!-- Restrict Quick Stack, Quick Restock, and the craft / repair / upgrade / reload / refuel
+	<!-- Restrict Quick Stack and the craft / repair / upgrade / reload / refuel
 	     pull to containers YOU placed. Intended for shared bases where players don't pool loot.
 	     Default false (any nearby player-placed container is used, as before).
 
 	     Note: containers with no recorded owner - POI loot crates, prefab-spawned and
 	     debug/creative-placed containers - are ALWAYS excluded, whatever this is set to. The mod
-	     never quick stacks into, quick restocks from, or crafts/repairs out of world loot.
+	     never quick stacks into, nor crafts/repairs out of world loot.
 
 	     When true, on top of that:
 	       * Owner only. The player who placed the container is the only one it works for -

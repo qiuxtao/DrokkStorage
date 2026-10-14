@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>disable</Nullable>
     <GamePath Condition="'$(GamePath)' == ''">$(MSBuildThisFileDirectory)../../game</GamePath>
-    <ModPath Condition="'$(ModPath)' == ''">$(MSBuildThisFileDirectory)../../bin/Release/DrokkStorage.dll</ModPath>
+    <ModPath Condition="'$(ModPath)' == ''">$(MSBuildThisFileDirectory)../../bin/Release/qiuxtaostorage.dll</ModPath>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="Assembly-CSharp">
@@ -14,7 +14,7 @@
     <Reference Include="UnityEngine.CoreModule">
       <HintPath>$(GamePath)/7DaysToDie_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
     </Reference>
-    <Reference Include="DrokkStorage">
+    <Reference Include="qiuxtaostorage">
       <HintPath>$(ModPath)</HintPath>
     </Reference>
     <PackageReference Include="HarmonyX" Version="2.13.0" />

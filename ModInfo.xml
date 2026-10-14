@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <xml>
-	<Name value="DrokkStorage" />
-  	<DisplayName value="Drokk Storage" />
+	<Name value="qiuxtaostorage" />
+  	<DisplayName value="qiuxtaostorage" />
 	<Description value="Everyone can open the same container, workbench or forge at the same time. Includes Quick Stack and Craft/Repair from containers too." />
-	<Author value="drokk" />
+	<Author value="qiuxtao" />
 	<Version value="1.0.7" />
 </xml>

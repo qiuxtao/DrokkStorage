@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <Version>1.0.7</Version>
-    <AssemblyName>DrokkStorage</AssemblyName>
+    <AssemblyName>qiuxtaostorage</AssemblyName>
     <RootNamespace>DrokkStorage</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>

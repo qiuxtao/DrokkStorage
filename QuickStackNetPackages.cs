@@ -153,12 +153,9 @@ public abstract class NetPackageInvManageAction : NetPackage
 
 public class NetPackageDoQuickStack : NetPackageInvManageAction
 {
-    protected QuickStackType type;
-
-    public NetPackageDoQuickStack Setup(Vector3i _center, List<Vector3i> _containerEntities, QuickStackType _type)
+    public new NetPackageDoQuickStack Setup(Vector3i _center, List<Vector3i> _containerEntities)
     {
         base.Setup(_center, _containerEntities);
-        type = _type;
         return this;
     }
 
@@ -169,16 +166,7 @@ public class NetPackageDoQuickStack : NetPackageInvManageAction
 
         try
         {
-            switch (type)
-            {
-                case QuickStackType.Stack:
-                    DrokkStoragePatches.ClientMoveQuickStack(center, containerEntities);
-                    break;
-
-                case QuickStackType.Restock:
-                    DrokkStoragePatches.ClientMoveQuickRestock(center, containerEntities);
-                    break;
-            }
+            DrokkStoragePatches.ClientMoveQuickStack(center, containerEntities);
         }
         catch (Exception e)
         {
@@ -188,19 +176,12 @@ public class NetPackageDoQuickStack : NetPackageInvManageAction
 
     public override int GetLength()
     {
-        return base.GetLength() + 1;
+        return base.GetLength();
     }
 
     public override void write(PooledBinaryWriter _writer)
     {
         base.write(_writer);
-        _writer.Write((byte)type);
-    }
-
-    public override void read(PooledBinaryReader _reader)
-    {
-        base.read(_reader);
-        type = (QuickStackType)_reader.ReadByte();
     }
 }
 
@@ -208,7 +189,7 @@ public class NetPackageDoQuickStack : NetPackageInvManageAction
 //
 // Every setting is read from each machine's own Config/settings.xml, but almost all of the
 // enforcement for the craft/repair/reload/refuel pull happens CLIENT-side (ScanQuadrant, the
-// transpiled count/removal helpers), while QuickStack/QuickRestock is gated server-side in
+// transpiled count/removal helpers), while QuickStack is gated server-side in
 // IsContainerUnlocked. Left alone, that means a server admin editing settings.xml on the server
 // changes nothing for connected players - they keep running their own file - and a player can
 // re-enable a feature the server turned off just by editing their local copy. This packet makes
@@ -347,12 +328,10 @@ public class NetPackageFindOpenableContainers : NetPackage
     public override NetPackageDirection PackageDirection => NetPackageDirection.ToServer;
     public override bool AllowedBeforeAuth => false;
     protected int playerEntityId;
-    protected QuickStackType type;
 
-    public NetPackageFindOpenableContainers Setup(int _playerEntityId, QuickStackType _type)
+    public NetPackageFindOpenableContainers Setup(int _playerEntityId)
     {
         playerEntityId = _playerEntityId;
-        type = _type;
         return this;
     }
 
@@ -366,9 +345,6 @@ public class NetPackageFindOpenableContainers : NetPackage
             var player = _world.GetEntity(playerEntityId) as EntityPlayer;
 
             if (player == null)
-                return;
-
-            if (type >= QuickStackType.Count || type < QuickStackType.Stack)
                 return;
 
             var center = new Vector3i(player.position);
@@ -387,7 +363,7 @@ public class NetPackageFindOpenableContainers : NetPackage
             var cinfo = ConnectionManager.Instance.Clients.ForEntityId(playerEntityId);
 
             if (cinfo != null)
-                cinfo.SendPackage(NetPackageManager.GetPackage<NetPackageDoQuickStack>().Setup(center, openableEntities, type));
+                cinfo.SendPackage(NetPackageManager.GetPackage<NetPackageDoQuickStack>().Setup(center, openableEntities));
         }
         catch (Exception e)
         {
@@ -397,19 +373,17 @@ public class NetPackageFindOpenableContainers : NetPackage
 
     public override int GetLength()
     {
-        return 5;
+        return 4;
     }
 
     public override void write(PooledBinaryWriter _writer)
     {
         base.write(_writer);
         _writer.Write(playerEntityId);
-        _writer.Write((byte)type);
     }
 
     public override void read(PooledBinaryReader _reader)
     {
         playerEntityId = _reader.ReadInt32();
-        type = (QuickStackType)_reader.ReadByte();
     }
 }

@@ -29,7 +29,7 @@ public class DrokkStorageConfig
     public bool enableForRefuel = true;
     public bool isDebug = false;
 
-    // Restrict every automated bulk item move (QuickStack, QuickRestock, and the
+    // Restrict every automated bulk item move (QuickStack and the
     // craft/repair/reload/refuel pull) to containers this player actually owns. Off by default -
     // turning it on is what stops shared-base players stacking into each other's crates.
     // Strict "owner only": keypad-allowed users and party allies do NOT count, and containers
@@ -57,16 +57,8 @@ public class DrokkStorageConfig
     public Vector3i stashDistance = new Vector3i(20, 20, 20);
     public KeyCode[] quickLockHotkeys = new KeyCode[] { KeyCode.LeftAlt };
     public KeyCode[] quickStackHotkeys = new KeyCode[] { KeyCode.LeftAlt, KeyCode.X };
-    public KeyCode[] quickRestockHotkeys = new KeyCode[] { KeyCode.LeftAlt, KeyCode.Z };
     public Color32 lockIconColor = new Color32(255, 0, 0, 255);
     public Color32 lockBorderColor = new Color32(128, 0, 0, 0);
-}
-
-public enum QuickStackType : byte
-{
-    Stack,
-    Restock,
-    Count
 }
 
 public class DrokkStorage : IModApi
@@ -317,10 +309,10 @@ public static class DrokkStoragePatches
     // Track viewers that are closing (to avoid refresh on close)
     private static readonly HashSet<int> viewersClosing = new HashSet<int>();
 
-    // QUICKSTACK/QUICKRESTOCK DUPE GUARD: NetPackageFindOpenableContainers.ProcessPackage computes
+    // QUICKSTACK DUPE GUARD: NetPackageFindOpenableContainers.ProcessPackage computes
     // "which containers are currently openable" on the server, then sends that list to the
     // *requesting client*, which executes the actual item move locally and syncs the result back -
-    // a full network round trip. Without this, two players clicking QuickStack/QuickRestock on the
+    // a full network round trip. Without this, two players clicking QuickStack on the
     // same container within that round trip both get told the container is available, both pull the
     // same stacks locally, and both writes land - duplicating items. Reserving every position handed
     // out to a client closes that window: a second player's request within the reservation period is
@@ -357,7 +349,6 @@ public static class DrokkStoragePatches
     }
 
     // QuickStack state
-    public static float[] lastClickTimes = new float[(int)QuickStackType.Count];
     public static XUiC_BackpackWindow backpackWindow;
     public static XUiC_ContainerStandardControls playerControls;
     public static XUiC_Backpack playerBackpack;
@@ -2256,7 +2247,7 @@ public static class DrokkStoragePatches
 
     // Unconditional floor, independent of CheckOwnership: a container with no recorded owner is
     // never part of any mod behaviour. That is the POI loot crate case - we neither quick stack
-    // into, quick restock from, nor craft/repair out of world loot. CheckOwnership then narrows
+    // into, nor craft/repair out of world loot. CheckOwnership then narrows
     // the remaining player-placed containers further to the ones owned by *you*.
     public static bool IsPlayerPlacedContainer(TileEntity _tileEntity)
     {
@@ -2307,7 +2298,7 @@ public static class DrokkStoragePatches
         return GameManager.Instance.World.IsMyLandProtectedBlock(_pos, _ppd);
     }
 
-    // ===== QUICK STACK AND QUICK RESTOCK FUNCTIONALITY =====
+    // ===== QUICK STACK FUNCTIONALITY =====
 
     public static bool IsContainerUnlocked(int _entityIdThatOpenedIt, TileEntity _tileEntity)
     {
@@ -2448,7 +2439,7 @@ public static class DrokkStoragePatches
                     if (!IsContainerUnlocked(_playerEntityId, val.Item2))
                         continue;
 
-                    // Another player's QuickStack/QuickRestock request is already in flight for
+                    // Another player's QuickStack request is already in flight for
                     // this container - skip it until their round trip completes or the reservation
                     // expires, rather than letting both players pull the same items.
                     if (IsReservedByOther(pos, _playerEntityId))
@@ -2460,27 +2451,14 @@ public static class DrokkStoragePatches
         }
     }
 
-    internal static XUiM_LootContainer.EItemMoveKind GetMoveKind(QuickStackType _type = QuickStackType.Stack)
+    internal static XUiM_LootContainer.EItemMoveKind GetMoveKind()
     {
-        try
-        {
-            float unscaledTime = Time.unscaledTime;
-            float lastClickTime = lastClickTimes[(int)_type];
-            lastClickTimes[(int)_type] = unscaledTime;
-
-            if (unscaledTime - lastClickTime < 2.0f)
-                return XUiM_LootContainer.EItemMoveKind.FillAndCreate;
-            else
-                return XUiM_LootContainer.EItemMoveKind.FillOnly;
-        }
-        catch (Exception e)
-        {
-            DrokkStorage.Dbgl(e.Message);
-            return XUiM_LootContainer.EItemMoveKind.FillOnly;
-        }
+        // QuickStack always uses the former second-click behavior: fill existing stacks
+        // and create new stacks in the same operation.
+        return XUiM_LootContainer.EItemMoveKind.FillAndCreate;
     }
 
-    // QuickStack/QuickRestock move many stacks in one call, and every stack XUiM_LootContainer.StashItems
+    // QuickStack moves many stacks in one call, and every stack XUiM_LootContainer.StashItems
     // touches fires its own TileEntity.SetModified() (once via TryStackItem, once via AddItem/UpdateSlot,
     // or once per slot through XUiC_LootContainer.HandleLootSlotChangedEvent). On a remote (non-host)
     // client each of those is a separate handle-tagged NetPackageTileEntity sent to the server, and the
@@ -2568,71 +2546,6 @@ public static class DrokkStoragePatches
         }
     }
 
-    public static void MoveQuickRestock()
-    {
-        try
-        {
-            // 3.0 loot containers are always position-backed tile entities (no entity-id concept),
-            // so an open LootContainer means a loot window is up - skip the auto QuickStack then.
-            if (backpackWindow.xui.LootContainer != null)
-                return;
-
-            var moveKind = GetMoveKind(QuickStackType.Restock);
-            EntityPlayerLocal primaryPlayer = GameManager.Instance.World.GetPrimaryPlayer();
-            LocalPlayerUI playerUI = LocalPlayerUI.GetUIForPlayer(primaryPlayer);
-            XUiC_LootWindowGroup lootWindowGroup = (XUiC_LootWindowGroup)((XUiWindowGroup)playerUI.windowManager.GetWindow("looting")).Controller;
-
-            foreach (var pair in FindNearbyLootContainers(new Vector3i(primaryPlayer.position), primaryPlayer.entityId))
-            {
-                if (pair.Item2.TryGetSelfOrFeature<ITileEntityLootable>(out var lootable))
-                {
-                    lootWindowGroup.lootWindow.SetTileEntityChest("QUICKSTACK", lootable);
-                    PackedBoolArray lockedSlots = new PackedBoolArray(lootWindowGroup.lootWindow.lootContainer.items.Length);
-                    RunBatchedStash(pair.Item2, () =>
-                        XUiM_LootContainer.StashItems(backpackWindow, lootWindowGroup.lootWindow.lootContainer, playerUI.mXUi.PlayerInventory, 0, lockedSlots, moveKind, playerControls.MoveStartBottomRight));
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            DrokkStorage.Dbgl(e.Message);
-        }
-    }
-
-    public static void ClientMoveQuickRestock(Vector3i center, IEnumerable<Vector3i> _entityContainers)
-    {
-        try
-        {
-            if (backpackWindow == null || backpackWindow.xui.LootContainer != null)
-                return;
-
-            var moveKind = GetMoveKind(QuickStackType.Restock);
-
-            if (_entityContainers == null)
-                return;
-
-            EntityPlayerLocal primaryPlayer = GameManager.Instance.World.GetPrimaryPlayer();
-            LocalPlayerUI playerUI = LocalPlayerUI.GetUIForPlayer(primaryPlayer);
-            XUiC_LootWindowGroup lootWindowGroup = (XUiC_LootWindowGroup)((XUiWindowGroup)playerUI.windowManager.GetWindow("looting")).Controller;
-
-            foreach (var offset in _entityContainers)
-            {
-                var val = GetInventoryFromBlockPosition(center + offset);
-                if (val.Item1 == null)
-                    continue;
-
-                lootWindowGroup.lootWindow.SetTileEntityChest("QUICKSTACK", val.Item1);
-                PackedBoolArray lockedSlots = new PackedBoolArray(lootWindowGroup.lootWindow.lootContainer.items.Length);
-                RunBatchedStash(val.Item2, () =>
-                    XUiM_LootContainer.StashItems(backpackWindow, lootWindowGroup.lootWindow.lootContainer, playerUI.mXUi.PlayerInventory, 0, lockedSlots, moveKind, playerControls.MoveStartBottomRight));
-            }
-        }
-        catch (Exception e)
-        {
-            DrokkStorage.Dbgl(e.Message);
-        }
-    }
-
     public static void QuickStackOnClick()
     {
         try
@@ -2640,7 +2553,7 @@ public static class DrokkStoragePatches
             if (SingletonMonoBehaviour<ConnectionManager>.Instance.IsSinglePlayer)
                 MoveQuickStack();
             else if (!SingletonMonoBehaviour<ConnectionManager>.Instance.IsServer)
-                SingletonMonoBehaviour<ConnectionManager>.Instance.SendToServer(NetPackageManager.GetPackage<NetPackageFindOpenableContainers>().Setup(GameManager.Instance.World.GetPrimaryPlayerId(), QuickStackType.Stack));
+                SingletonMonoBehaviour<ConnectionManager>.Instance.SendToServer(NetPackageManager.GetPackage<NetPackageFindOpenableContainers>().Setup(GameManager.Instance.World.GetPrimaryPlayerId()));
             else if (!GameManager.IsDedicatedServer)
             {
                 var player = GameManager.Instance.World.GetPrimaryPlayer();
@@ -2649,30 +2562,6 @@ public static class DrokkStoragePatches
                 foreach (var pair in FindNearbyLootContainers(center, player.entityId))
                     offsets.Add(pair.Item1);
                 ClientMoveQuickStack(center, offsets);
-            }
-        }
-        catch (Exception e)
-        {
-            DrokkStorage.Dbgl(e.Message);
-        }
-    }
-
-    public static void QuickRestockOnClick()
-    {
-        try
-        {
-            if (SingletonMonoBehaviour<ConnectionManager>.Instance.IsSinglePlayer)
-                MoveQuickRestock();
-            else if (!SingletonMonoBehaviour<ConnectionManager>.Instance.IsServer)
-                SingletonMonoBehaviour<ConnectionManager>.Instance.SendToServer(NetPackageManager.GetPackage<NetPackageFindOpenableContainers>().Setup(GameManager.Instance.World.GetPrimaryPlayerId(), QuickStackType.Restock));
-            else if (!GameManager.IsDedicatedServer)
-            {
-                var player = GameManager.Instance.World.GetPrimaryPlayer();
-                var center = new Vector3i(player.position);
-                List<Vector3i> offsets = new List<Vector3i>(1024);
-                foreach (var pair in FindNearbyLootContainers(center, player.entityId))
-                    offsets.Add(pair.Item1);
-                ClientMoveQuickRestock(center, offsets);
             }
         }
         catch (Exception e)
@@ -3366,7 +3255,7 @@ public static class DrokkStoragePatches
         }
     }
 
-    // ===== QUICK STACK AND QUICK RESTOCK PATCHES =====
+    // ===== QUICK STACK PATCHES =====
 
     [HarmonyPatch(typeof(XUiC_BackpackWindow), "Init")]
     public static class BackpackWindow_Init_Patch
@@ -3378,7 +3267,6 @@ public static class DrokkStoragePatches
                 backpackWindow = __instance;
                 playerControls = __instance.GetChildByType<XUiC_ContainerStandardControls>();
                 playerBackpack = __instance.backpackGrid;
-                lastClickTimes.Fill(0.0f);
 
                 XUiController[] slots = playerBackpack.GetItemStackControllers();
 
@@ -3403,7 +3291,7 @@ public static class DrokkStoragePatches
                     };
                 }
 
-                // Handle clicking on QuickStack and QuickRestock
+                // Handle clicking on QuickStack
                 XUiController childById = playerControls.GetChildById("btnMoveQuickStack");
                 if (childById != null)
                 {
@@ -3417,14 +3305,6 @@ public static class DrokkStoragePatches
                     Log.Warning(" [DrokkStorage] btnMoveQuickStack not found in backpack UI — XUi patch may have missed the backpack window (a backpack-overhaul mod may have renamed it)");
                 }
 
-                childById = playerControls.GetChildById("btnMoveQuickRestock");
-                if (childById != null)
-                {
-                    childById.OnPress += delegate (XUiController _sender, int _args)
-                    {
-                        QuickRestockOnClick();
-                    };
-                }
             }
             catch (Exception e)
             {
@@ -3562,17 +3442,6 @@ public static class DrokkStoragePatches
                     }
 
                     QuickStackOnClick();
-                    Audio.Manager.PlayButtonClick();
-                }
-                else if (UICamera.GetKeyDown(DrokkStorage.config.quickRestockHotkeys[DrokkStorage.config.quickRestockHotkeys.Length - 1]))
-                {
-                    for (int i = 0; i < DrokkStorage.config.quickRestockHotkeys.Length - 1; i++)
-                    {
-                        if (!UICamera.GetKey(DrokkStorage.config.quickRestockHotkeys[i]))
-                            return;
-                    }
-
-                    QuickRestockOnClick();
                     Audio.Manager.PlayButtonClick();
                 }
             }

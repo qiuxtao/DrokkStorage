@@ -7,7 +7,7 @@ dotnet build DrokkStorage.csproj -c Release -p:GamePath="D:\SteamLibrary\steamap
 dotnet run --project tests/WorkstationSync/WorkstationSync.csproj -p:GamePath="D:\SteamLibrary\steamapps\common\7 Days To Die"
 ```
 
-Use `-p:ModPath="/absolute/path/to/DrokkStorage.dll"` to test another compiled DLL. The harness checks the loaded DLL against that file using SHA-256. Game binaries are not distributed with the tests.
+Use `-p:ModPath="/absolute/path/to/qiuxtaostorage.dll"` to test another compiled DLL. The harness checks the loaded DLL against that file using SHA-256. Game binaries are not distributed with the tests.
 
 The harness applies the actual mod Harmony patches to the actual game assembly. It checks open/closed windows, pending acknowledgements, both network directions, the feature toggle, packet clocks and tools, output/queue serialization, remote tick suppression, exceptional reads, and scoped/nested close guards.
 

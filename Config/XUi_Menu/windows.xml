@@ -11,7 +11,7 @@
              reads as an extension of those boxes rather than an interrupting popup, and opened
              non-modally (see Show()) so it never blocks the main menu underneath it. -->
         <window name="windowDrokkUpdateNotice" anchor="Top" pos="310,-303" width="560" height="280"
-                controller="XUiC_DrokkUpdateNotice, DrokkStorage" cursor_area="true">
+                controller="XUiC_DrokkUpdateNotice, qiuxtaostorage" cursor_area="true">
 
             <!-- Single panel spanning the full window (header included) so the gray background
                  sits behind the title as well, instead of the title having its own separate
