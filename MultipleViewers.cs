@@ -727,16 +727,22 @@ public static class DrokkStoragePatches
             string sig = QueueSignature(teQueue);
             if (sig == lastQueueSignature)
             {
+                CorrectQueueDisplay(te, q.GetRecipesToCraft());
                 return;
             }
 
-            int slots = q.GetRecipesToCraft().Length;
+            var rows = q.GetRecipesToCraft();
+            int slots = rows.Length;
             IsRebuildingQueue = true;
             try
             {
                 for (int i = 0; i < slots; i++)
                 {
                     RecipeQueueItem it = (i < teQueue.Length) ? teQueue[i] : null;
+                    // A different row changed, or only the serialized IsCrafting flag changed.
+                    // Keep this row's frame-by-frame progress instead of calling SetRecipe and
+                    // resetting its clock/display on every structural queue notification.
+                    if (CanKeepQueueRow(rows[i], it)) continue;
                     if (IsLive(it))
                     {
                         // recipeModification: true is required - SetRecipe refuses to overwrite a
@@ -751,6 +757,9 @@ public static class DrokkStoragePatches
                     }
                 }
                 q.IsDirty = true;
+                // Replaced rows already have their new item clock. Unchanged rows must retain
+                // the monotonic guard, including when another viewer adds/cancels a task.
+                CorrectQueueDisplay(te, q.GetRecipesToCraft());
                 openWindow.SetAllChildrenDirty();
                 // A server refresh must not look like a local IsCrafting edge in Update(),
                 // which would echo the whole workstation back and rewind server progress.
@@ -763,6 +772,45 @@ public static class DrokkStoragePatches
                 Log.Out($"[DrokkStorage] WS queue REBUILT from TE: {sig}");
         }
 
+        public static void CorrectQueueDisplay(TileEntityWorkstation te, XUiC_RecipeStack[] rows, bool resetProgress = false)
+        {
+            ulong now = GameTimer.Instance?.ticks ?? te.lastTickTime;
+            float tickAge = now >= te.lastTickTime ? (now - te.lastTickTime) / 20f : 0f;
+            for (int i = 0; i < rows.Length; i++)
+            {
+                var item = i < te.Queue.Length ? te.Queue[i] : null;
+                if (!IsLive(item)) continue;
+                var row = rows[i];
+                bool wasCrafting = row.IsCrafting;
+                bool isCrafting = i == te.Queue.Length - 1 && te.IsCrafting;
+                // TE progress is a tick snapshot, not the remaining time at this frame.
+                // Account for its age without simulating or writing the workstation. Network
+                // latency can still leave it behind the local smooth countdown; do not rewind
+                // a continuously running item. New items and pause/resume may reset normally.
+                float remaining = Math.Max(0f, item.CraftingTimeLeft - (isCrafting ? tickAge : 0f));
+                if (!resetProgress && wasCrafting && isCrafting)
+                    remaining = Math.Min(Math.Max(0f, row.craftingTimeLeft), remaining);
+                row.IsCrafting = isCrafting;
+                row.craftingTimeLeft = remaining;
+                row.totalCraftTimeLeft = Math.Max(0f, item.OneItemCraftTime * (item.Multiplier - 1) + row.craftingTimeLeft);
+                row.IsDirty = true;
+            }
+            if (openWindow?.craftingQueue != null)
+                openWindow.wasCrafting = openWindow.craftingQueue.IsCrafting();
+        }
+
+        public static bool CanKeepQueueRow(XUiC_RecipeStack row, RecipeQueueItem item)
+        {
+            if (row == null) return false;
+            if (!IsLive(item)) return !row.HasRecipe() && !row.IsCrafting;
+            // Repairs carry additional state; retain their normal reconstruction path.
+            if (item.AmountToRepair != 0 || row.amountToRepair != 0) return false;
+            return row.GetRecipe() != null && RecipeKey(row.GetRecipe()) == RecipeKey(item)
+                && row.GetRecipeCount() == item.Multiplier
+                && row.StartingEntityId == item.StartingEntityId
+                && row.OutputQuality == item.Quality
+                && row.GetOneItemCraftTime() == item.OneItemCraftTime;
+        }
 
         // Queue changes are explicit operations. A recipe name cannot identify a task:
         // two rows may craft the same recipe with completely different counts and clocks.

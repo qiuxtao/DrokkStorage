@@ -72,6 +72,7 @@ internal static class Program
             typeof(DrokkStoragePatches.WorkstationWindowGroup_syncTEfromUI_Patch),
             typeof(DrokkStoragePatches.XUiC_WorkstationFuelGrid_Update_Patch),
             typeof(DrokkStoragePatches.XUiC_RecipeStack_Update_Patch),
+            typeof(SharedCountdownDisplay.TimerTextPatch),
             typeof(DrokkStoragePatches.XUiM_Workstation_SetRecipeQueueItems_Patch),
             typeof(DrokkStoragePatches.XUiC_CraftingQueue_AddRecipeToCraft_Patch),
             typeof(DrokkStoragePatches.XUiC_CraftingQueue_AddItemToRepair_Patch),
@@ -102,6 +103,9 @@ internal static class Program
         QueueUiCases(harmony);
         FuelButtonCases(harmony);
         SmoothCountdownCases();
+        QueueRefreshContinuityCases(harmony);
+        BatchLabelCases();
+        RenderedBatchLabelCases(harmony);
         RemovalLedgerCases();
         AutoIgnitionCases(harmony);
         OcbCompatibilityCases();
@@ -570,6 +574,159 @@ internal static class Program
         finally { DrokkStoragePatches.WorkstationLiveSync.WindowClosed(window); }
         Console.WriteLine("PASS: received fuel enables/disables button, remaining burn time and remote on/off control state");
     }
+    private static float labelTime;
+    private static string capturedLabel;
+    private static bool CaptureLabel(string __0) { capturedLabel = __0; return false; }
+    private static void IgnoreVisible(XUiView view, bool visible) { }
+    private static IEnumerable<CodeInstruction> HeadlessLabelVisibility(IEnumerable<CodeInstruction> codes)
+    {
+        var setter = AccessTools.PropertySetter(typeof(XUiView), "IsVisible");
+        foreach (var code in codes)
+        {
+            if (code.Calls(setter))
+            {
+                code.opcode = System.Reflection.Emit.OpCodes.Call;
+                code.operand = AccessTools.Method(typeof(Program), nameof(IgnoreVisible));
+            }
+            yield return code;
+        }
+    }
+
+    private static void RenderedBatchLabelCases(Harmony harmony)
+    {
+        var source = AccessTools.Field(typeof(SharedCountdownDisplay), "timeSource");
+        var previousSource = source.GetValue(null);
+        var text = AccessTools.Method(typeof(XUiV_Label), "SetTextImmediately");
+        var render = AccessTools.Method(typeof(XUiC_RecipeStack), "updateRecipeData");
+        source.SetValue(null, (Func<float>)(() => labelTime));
+        harmony.Patch(text, prefix: new HarmonyMethod(typeof(Program), nameof(CaptureLabel)));
+        harmony.Patch(render, transpiler: new HarmonyMethod(typeof(Program), nameof(HeadlessLabelVisibility)));
+        try
+        {
+            var row = (XUiC_RecipeStack)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_RecipeStack));
+            var group = (XUiWindowGroup)RuntimeHelpers.GetUninitializedObject(typeof(XUiWindowGroup));
+            group.Controller = (XUiC_WorkstationWindowGroup)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_WorkstationWindowGroup));
+            row.windowGroup = group;
+            row.recipe = (Recipe)RuntimeHelpers.GetUninitializedObject(typeof(Recipe));
+            row.oneItemCraftTime = 1; row.IsCrafting = true;
+            row.timer = (XUiController)RuntimeHelpers.GetUninitializedObject(typeof(XUiController));
+            row.timer.ViewComponent = (XUiV_Label)RuntimeHelpers.GetUninitializedObject(typeof(XUiV_Label));
+            var update = AccessTools.Method(typeof(XUiC_RecipeStack), "updateRecipeData");
+            for (int second = 0; second <= 5; second++)
+            {
+                labelTime = second;
+                int completed = second / 2 * 2;
+                row.recipeCount = 10 - completed;
+                row.totalCraftTimeLeft = 10 - completed - Math.Min(1, second - completed);
+                update.Invoke(row, null);
+                Assert(capturedLabel == "00:" + (10 - second).ToString("00"),
+                    "actual game timer text stays sequential across server item acknowledgements");
+            }
+        }
+        finally
+        {
+            source.SetValue(null, previousSource);
+            harmony.Unpatch(text, HarmonyPatchType.Prefix, harmony.Id);
+            harmony.Unpatch(render, HarmonyPatchType.Transpiler, harmony.Id);
+        }
+    }
+
+    private static void BatchLabelCases()
+    {
+        DrokkStorage.config.multiViewersEnabled = true;
+        var recipe = (Recipe)RuntimeHelpers.GetUninitializedObject(typeof(Recipe));
+        recipe.itemValueType = 1;
+        foreach (int fps in new[] { 30, 60, 144 })
+        {
+            var row = (XUiC_RecipeStack)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_RecipeStack));
+            var window = (XUiC_WorkstationWindowGroup)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_WorkstationWindowGroup));
+            var group = (XUiWindowGroup)RuntimeHelpers.GetUninitializedObject(typeof(XUiWindowGroup));
+            group.Controller = window; row.windowGroup = group;
+            row.recipe = recipe; row.recipeCount = 10; row.oneItemCraftTime = 1;
+            row.IsCrafting = true;
+            Assert(SharedCountdownDisplay.Sample(10, row, 0) == 10, "batch display starts at snapshot time");
+            for (int frame = 1; frame <= 5 * fps; frame++)
+            {
+                float now = (float)frame / fps;
+                // Server acknowledges completions only every two seconds. Per-item display
+                // is clamped at zero between those ticks, as it is in the live game.
+                int completed = (int)(now / 2) * 2;
+                row.recipeCount = 10 - completed;
+                float raw = 10 - completed - Math.Min(1f, now - completed);
+                float shown = SharedCountdownDisplay.Sample(raw, row, now);
+                Assert(Math.Abs(shown - (10 - now)) < 0.001f,
+                    "whole-batch label advances steadily through item boundaries at " + fps + " FPS");
+                Assert(row.recipeCount == 10 - completed, "display prediction never retires server tasks");
+            }
+            row.IsCrafting = false;
+            Assert(SharedCountdownDisplay.Sample(6, row, 6) == 6, "pause uses server checkpoint");
+            Assert(SharedCountdownDisplay.Sample(6, row, 8) == 6, "paused label does not count down");
+            row.IsCrafting = true;
+            Assert(SharedCountdownDisplay.Sample(6, row, 9) == 6, "resume resets time anchor");
+            row.recipeCount = 100;
+            Assert(SharedCountdownDisplay.Sample(100, row, 10) == 100, "new larger batch resets label");
+        }
+    }
+
+    private static int reconstructedRows;
+    private static bool ObserveQueueReconstruction(ref bool __result)
+    {
+        reconstructedRows++;
+        __result = true;
+        return false;
+    }
+
+    private static void QueueRefreshContinuityCases(Harmony harmony)
+    {
+        var add = AccessTools.Method(typeof(XUiC_CraftingQueue), "AddRecipeToCraftAtIndex");
+        var dirty = AccessTools.Method(typeof(XUiController), "SetAllChildrenDirty");
+        harmony.Patch(add, prefix: new HarmonyMethod(typeof(Program), nameof(ObserveQueueReconstruction)));
+        harmony.Patch(dirty, prefix: new HarmonyMethod(typeof(Program), nameof(SkipRender)));
+        bool debug = DrokkStorage.config.isDebug;
+        DrokkStorage.config.isDebug = false;
+        DrokkStorage.config.multiViewersEnabled = true;
+        var window = (XUiC_WorkstationWindowGroup)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_WorkstationWindowGroup));
+        try
+        {
+            var recipe = (Recipe)RuntimeHelpers.GetUninitializedObject(typeof(Recipe));
+            recipe.itemValueType = 1;
+            var te = NewWorkstation(false, false);
+            te.lastTickTime = GameTimer.Instance.ticks;
+            te.queue = new[] { new RecipeQueueItem(), new RecipeQueueItem { Recipe = recipe,
+                Multiplier = 10, CraftingTimeLeft = 10, OneItemCraftTime = 10 } };
+            window.WorkstationData = new XUiM_Workstation(te);
+            var queue = (XUiC_CraftingQueue)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_CraftingQueue));
+            var empty = (XUiC_RecipeStack)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_RecipeStack));
+            var head = (XUiC_RecipeStack)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_RecipeStack));
+            head.recipe = recipe; head.recipeCount = 10; head.oneItemCraftTime = 10;
+            head.IsCrafting = true; head.craftingTimeLeft = 8;
+            te.queue[1].StartingEntityId = head.StartingEntityId;
+            te.queue[1].Quality = (byte)head.OutputQuality;
+            queue.queueItems = new XUiController[] { empty, head };
+            window.craftingQueue = queue;
+            DrokkStoragePatches.WorkstationLiveSync.WindowOpened(window);
+            reconstructedRows = 0;
+            DrokkStoragePatches.WorkstationLiveSync.RefreshQueueFromTileEntity(te);
+            Assert(reconstructedRows == 0, "initial queue signature refresh preserves matching rows");
+            Assert(head.craftingTimeLeft == 8, "structural refresh cannot rewind running countdown to 10");
+            head.craftingTimeLeft = 7.5f;
+            te.queue[1].IsCrafting = true;
+            DrokkStoragePatches.WorkstationLiveSync.RefreshQueueFromTileEntity(te);
+            Assert(reconstructedRows == 0 && head.craftingTimeLeft == 7.5f,
+                "serialized crafting-flag edge preserves continuous local clock");
+            te.queue[1].Multiplier = 9;
+            Assert(!DrokkStoragePatches.WorkstationLiveSync.CanKeepQueueRow(head, te.queue[1]),
+                "confirmed next item still reconstructs quantity and per-item clock");
+        }
+        finally
+        {
+            DrokkStoragePatches.WorkstationLiveSync.WindowClosed(window);
+            DrokkStorage.config.isDebug = debug;
+            harmony.Unpatch(add, HarmonyPatchType.Prefix, harmony.Id);
+            harmony.Unpatch(dirty, HarmonyPatchType.Prefix, harmony.Id);
+        }
+    }
+
     private static void SmoothCountdownCases()
     {
         DrokkStorage.config.multiViewersEnabled = true;
@@ -598,7 +755,10 @@ internal static class Program
         }
         te.queue[1].CraftingTimeLeft = 40;
         DrokkStoragePatches.WorkstationLiveSync.CorrectQueueDisplay(te, rows);
-        Assert(rows[1].craftingTimeLeft == 40, "newer server progress advances display");
+        Assert(rows[1].craftingTimeLeft == 40, "server correction updates internal clock independently of smooth label");
+        te.queue[1].CraftingTimeLeft = 30;
+        DrokkStoragePatches.WorkstationLiveSync.CorrectQueueDisplay(te, rows);
+        Assert(rows[1].craftingTimeLeft == 30, "large progress discrepancy resynchronizes immediately");
         te.isModuleUsed[3] = true; te.isBurning = false;
         te.queue[1].CraftingTimeLeft = 41;
         DrokkStoragePatches.WorkstationLiveSync.CorrectQueueDisplay(te, rows);
