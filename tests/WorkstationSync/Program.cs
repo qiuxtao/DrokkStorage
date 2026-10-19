@@ -104,7 +104,67 @@ internal static class Program
         SmoothCountdownCases();
         RemovalLedgerCases();
         AutoIgnitionCases(harmony);
+        OcbCompatibilityCases();
         Console.WriteLine($"ALL PASS: {assertions} assertions; mod={modPath}; SHA256={Convert.ToHexString(actualHash)}; Harmony={typeof(Harmony).Assembly.GetName().Version}");
+    }
+
+    private static void OcbCompatibilityCases()
+    {
+        string path = Path.Combine(Metadata("GamePath"), "Mods", "OcbStopFuelWaste", "StopFuelWaste.dll");
+        if (!File.Exists(path))
+        {
+            Console.WriteLine("SKIP: combined-mod regression requires Mods/OcbStopFuelWaste/StopFuelWaste.dll");
+            return;
+        }
+        var assembly = AssemblyLoadContext.Default.LoadFromAssemblyPath(Path.GetFullPath(path));
+        var ocb = new Harmony("regression.ocb.actual");
+        ocb.PatchAll(assembly);
+        var adapters = new Harmony("regression.ocb.compatibility");
+        var compatibility = typeof(DrokkStorage).Assembly.GetType("OcbStopFuelWasteCompatibility");
+        foreach (var type in compatibility.GetNestedTypes(BindingFlags.NonPublic))
+            adapters.CreateClassProcessor(type).Patch();
+        try
+        {
+            DrokkStorage.config.multiViewersEnabled = true;
+            var patch = assembly.GetType("StopFuelWaste+TileEntityWorkstation_UpdateTick");
+            var hasWork = AccessTools.Method(patch, "HasWork");
+            var te = NewWorkstation(false, false);
+            var recipe = (Recipe)RuntimeHelpers.GetUninitializedObject(typeof(Recipe));
+            te.queue = new[] { new RecipeQueueItem { Recipe = recipe, Multiplier = 2, IsCrafting = false } };
+            te.isBurning = true;
+            Assert((bool)hasWork.Invoke(null, new object[] { te, te.queue, te.input }), "OCB sees live task despite stale crafting flag");
+            object[] before = { te, te.queue, te.input, false };
+            AccessTools.Method(patch, "Prefix").Invoke(null, before);
+            Assert((bool)before[3], "actual OCB prefix arms completion detection");
+            te.queue[0].Multiplier = 0;
+            te.queue[0].IsCrafting = true;
+            AccessTools.Method(patch, "Postfix").Invoke(null, new object[] { te, te.queue, te.input, before[3] });
+            Assert(!te.isBurning, "actual OCB postfix extinguishes completed shared workstation");
+            te.isBurning = true;
+            before = new object[] { te, te.queue, te.input, false };
+            AccessTools.Method(patch, "Prefix").Invoke(null, before);
+            AccessTools.Method(patch, "Postfix").Invoke(null, before);
+            Assert(te.isBurning, "OCB preserves idle manual heat-only burning");
+            var material = new ItemValue(0, false);
+            material.type = 1;
+            te.input = new[] { new ItemStack(material, 1) };
+            Assert(!(bool)hasWork.Invoke(null, new object[] { te, te.queue, te.input }), "unused cooking ingredients do not keep an empty queue burning");
+            te.isModuleUsed[4] = true;
+            Assert((bool)hasWork.Invoke(null, new object[] { te, te.queue, te.input }), "forge continues burning while melting input remains");
+            te.input[0].Clear();
+            Assert(!(bool)hasWork.Invoke(null, new object[] { te, te.queue, te.input }), "empty forge input allows shutdown");
+            var ui = assembly.GetType("StopFuelWaste+XUiC_WorkstationFuelGrid_Update");
+            AccessTools.Method(ui, "Postfix").Invoke(null, new object[] { true, null, null, null });
+            Assert(true, "shared UI cannot initiate a second shutdown from stale rows");
+            DrokkStorage.config.multiViewersEnabled = false;
+            Assert((bool)hasWork.Invoke(null, new object[] { te, te.queue, te.input }), "disabled shared mode preserves original OCB crafting-flag semantics");
+            Console.WriteLine("PASS: actual OcbStopFuelWaste DLL loaded and patched together; server completion, melting, idle heat and UI guards");
+        }
+        finally
+        {
+            adapters.UnpatchSelf();
+            ocb.UnpatchSelf();
+        }
     }
 
     private static int queuedCount, ignitionCalls;

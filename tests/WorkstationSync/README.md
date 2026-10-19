@@ -16,3 +16,5 @@ Additional regressions cover `100 + 1 + 2 + 3` duplicate recipe tasks, selected-
 Countdown cases also cover snapshot age, repeated old snapshots without backward display jumps, unchanged authoritative queue data, waiting rows, pause/resume, next-item resets and clock resets.
 
 This is a headless protocol and patch regression, not an end-to-end multiplayer run. Rendering and UI refresh are intercepted; no world, player, loaded recipe database, or network transport is started. The test process uses HarmonyX 2.13 on .NET 8 because the game's bundled Mono Harmony runtime cannot patch under .NET 8. Production still builds against the game's bundled Harmony.
+
+When GamePath contains Mods/OcbStopFuelWaste/StopFuelWaste.dll, the harness also loads that actual mod, installs both sets of patches, and verifies shared queue completion, forge inputs, idle heat-only burning, and suppression of client UI shutdown. This optional group prints SKIP when the DLL is absent. It does not start a live multiplayer world.
