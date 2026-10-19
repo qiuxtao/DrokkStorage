@@ -1826,6 +1826,11 @@ public static class DrokkStoragePatches
         try
         {
             queued = group.AddItemToQueue(recipe, reservation.CraftCount);
+            // The explicit-count overload is inherited from CraftingWindowGroup and bypasses
+            // WorkstationWindowGroup.AddItemToQueue(Recipe), whose override turns on the fuel.
+            // Preserve the captured count while restoring that workstation-only behavior.
+            if (queued && group is XUiC_WorkstationWindowGroup workstation)
+                workstation.fuelWindow?.TurnOn();
         }
         catch
         {

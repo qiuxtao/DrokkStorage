@@ -103,7 +103,52 @@ internal static class Program
         FuelButtonCases(harmony);
         SmoothCountdownCases();
         RemovalLedgerCases();
+        AutoIgnitionCases(harmony);
         Console.WriteLine($"ALL PASS: {assertions} assertions; mod={modPath}; SHA256={Convert.ToHexString(actualHash)}; Harmony={typeof(Harmony).Assembly.GetName().Version}");
+    }
+
+    private static int queuedCount, ignitionCalls;
+    private static bool CaptureQueueCount(int __1, ref bool __result)
+    {
+        queuedCount = __1;
+        __result = true;
+        return false;
+    }
+    private static bool CaptureIgnition() { ignitionCalls++; return false; }
+
+    private static void AutoIgnitionCases(Harmony harmony)
+    {
+        var add = AccessTools.Method(typeof(XUiC_CraftingWindowGroup), "AddItemToQueue", new[] { typeof(Recipe), typeof(int) });
+        var turnOn = AccessTools.Method(typeof(XUiC_WorkstationFuelGrid), "TurnOn");
+        harmony.Patch(add, prefix: new HarmonyMethod(typeof(Program), nameof(CaptureQueueCount)));
+        harmony.Patch(turnOn, prefix: new HarmonyMethod(typeof(Program), nameof(CaptureIgnition)));
+        try
+        {
+            var reservationType = typeof(DrokkStoragePatches).GetNestedType("CraftQueueReservation", BindingFlags.NonPublic);
+            foreach (bool workstation in new[] { true, false })
+            foreach (int count in new[] { 2, 100 })
+            {
+                var group = (XUiC_CraftingWindowGroup)RuntimeHelpers.GetUninitializedObject(
+                    workstation ? typeof(XUiC_WorkstationWindowGroup) : typeof(XUiC_CraftingWindowGroup));
+                if (group is XUiC_WorkstationWindowGroup window)
+                    window.fuelWindow = (XUiC_WorkstationFuelGrid)RuntimeHelpers.GetUninitializedObject(typeof(XUiC_WorkstationFuelGrid));
+                var recipe = (Recipe)RuntimeHelpers.GetUninitializedObject(typeof(Recipe));
+                var reservation = Activator.CreateInstance(reservationType, nonPublic: true);
+                reservationType.GetField("Group").SetValue(reservation, group);
+                reservationType.GetField("Recipe").SetValue(reservation, recipe);
+                reservationType.GetField("CraftCount").SetValue(reservation, count);
+                AccessTools.Field(typeof(DrokkStoragePatches), "pendingCraftQueue").SetValue(null, reservation);
+                queuedCount = ignitionCalls = 0;
+                Assert((bool)AccessTools.Method(typeof(DrokkStoragePatches), "CommitCraftQueue").Invoke(null, new object[] { group, recipe }), "commit succeeds");
+                Assert(queuedCount == count, "ignition preserves explicit batch quantity");
+                Assert(ignitionCalls == (workstation ? 1 : 0), "only workstation craft ignites fuel once");
+            }
+        }
+        finally
+        {
+            harmony.Unpatch(add, HarmonyPatchType.All, harmony.Id);
+            harmony.Unpatch(turnOn, HarmonyPatchType.All, harmony.Id);
+        }
     }
 
     private static void RemovalLedgerCases()
