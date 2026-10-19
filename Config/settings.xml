@@ -87,5 +87,5 @@
 	     open/close, etc). Only needed when diagnosing a sync bug - leave false otherwise, since
 	     this logging runs on every container sync near the player and spams the console /
 	     costs frame time. Default false. -->
-	<Debug value="false" />
+	<Debug value="true" />
 </DrokkStorage>

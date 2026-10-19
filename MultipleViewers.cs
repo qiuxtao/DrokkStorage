@@ -27,7 +27,7 @@ public class DrokkStorageConfig
     public bool allowLockedContainers = true;
     public bool enableForReload = true;
     public bool enableForRefuel = true;
-    public bool isDebug = false;
+    public bool isDebug = true;
 
     // Restrict every automated bulk item move (QuickStack and the
     // craft/repair/reload/refuel pull) to containers this player actually owns. Off by default -
@@ -1670,6 +1670,294 @@ public static class DrokkStoragePatches
 
     private static readonly List<StorageSource> currentSources = new List<StorageSource>();
 
+    // ItemActionEntryCraft queues a recipe before it calls RemoveItems.  That ordering is harmless
+    // for the vanilla inventory, but it becomes a dupe window when the mod supplies an ingredient
+    // from a nearby source: a stale source can pass hasItems(), the queue row is created, and the
+    // later pull can remove only part (or none) of the requested amount.  The craft transpiler
+    // below reserves an empty queue slot first, lets the normal removal path run, then commits the
+    // queue row only after the removal has passed a fresh all-sources check.
+    private sealed class CraftQueueReservation
+    {
+        public XUiC_CraftingWindowGroup Group;
+        public Recipe Recipe;
+        public int CraftCount;
+    }
+
+    private sealed class CraftRemovalTransaction
+    {
+        // Equal stacks can be independent removals from different sources. Track identity,
+        // not ItemStack's value equality, or two 1-item pulls become a single refund entry.
+        private readonly List<ItemStack> seen = new List<ItemStack>();
+        public readonly List<ItemStack> Removed = new List<ItemStack>();
+        public XUiM_PlayerInventory Inventory;
+
+        public void Register(IList<ItemStack> list, XUiM_PlayerInventory inventory)
+        {
+            if (Inventory == null)
+                Inventory = inventory;
+            RecordNewItems(list, seedOnly: true);
+        }
+
+        public void RecordNewItems(IList<ItemStack> list, bool seedOnly = false)
+        {
+            if (list == null)
+                return;
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                var item = list[i];
+                if (item == null || seen.Any(previous => ReferenceEquals(previous, item)))
+                    continue;
+                seen.Add(item);
+                if (seedOnly)
+                    continue;
+
+                if (item.count > 0 && item.itemValue != null)
+                    Removed.Add(item.Clone());
+            }
+        }
+    }
+
+    private static CraftQueueReservation pendingCraftQueue;
+    private static CraftRemovalTransaction pendingCraftRemoval;
+    private static bool pendingCraftRemovalFailed;
+    private static bool pendingCraftFreshScan;
+
+    private static bool QueueHasServerCapacity(XUiC_CraftingWindowGroup group)
+    {
+        if (!DrokkStorage.config.multiViewersEnabled || WorkstationLiveSync.IsRebuildingQueue)
+            return true;
+
+        var window = group?.windowGroup?.Controller as XUiC_WorkstationWindowGroup;
+        if (window?.WorkstationData?.TileEntity?.Queue is RecipeQueueItem[] serverQueue)
+            return !serverQueue.All(item => item?.Recipe != null && item.Multiplier > 0);
+
+        return true;
+    }
+
+    // Same signature as XUiC_CraftingWindowGroup.AddItemToQueue(Recipe), but this only reserves a
+    // currently empty local row.  The actual AddItemToQueue call is inserted after RemoveItems by
+    // ItemActionEntryCraft_OnActivated_QueueReservation_Patch.
+    private static bool PrepareCraftQueue(XUiC_CraftingWindowGroup group, Recipe recipe)
+    {
+        AbortPendingCraftQueue();
+        if (group == null || recipe == null || group.craftingQueue == null)
+            return false;
+
+        // The local queue is a UI cache.  In multiplayer it can still show every row as occupied
+        // for a few frames after the server has accepted another player's add.  Refresh it from
+        // the workstation first, then let the real AddRecipeToCraft call make the final capacity
+        // decision.  Rejecting from the stale UI here was the intermittent "queue full" report.
+        if (DrokkStorage.config.multiViewersEnabled && !WorkstationLiveSync.IsRebuildingQueue)
+        {
+            var window = group.windowGroup?.Controller as XUiC_WorkstationWindowGroup;
+            var te = window?.WorkstationData?.TileEntity;
+            if (te != null && !te.bWaitingForServerResponse && WorkstationLiveSync.IsOpenOn(te))
+                WorkstationLiveSync.RefreshQueueFromTileEntity(te);
+        }
+
+        if (!QueueHasServerCapacity(group))
+            return false;
+
+        // Capture the counter before any removal or UI refresh can reset it.  Calling the
+        // one-argument overload during commit reads the counter again and can turn a request for
+        // 100 crafts into a queue row with multiplier 1 (or reuse the previous 100).
+        int craftCount = group.craftCountControl != null ? group.craftCountControl.Count : 1;
+        if (craftCount <= 0)
+            craftCount = 1;
+
+        pendingCraftQueue = new CraftQueueReservation
+        {
+            Group = group,
+            Recipe = recipe,
+            CraftCount = craftCount
+        };
+        pendingCraftRemoval = new CraftRemovalTransaction();
+        pendingCraftRemovalFailed = false;
+        pendingCraftFreshScan = false;
+        return true;
+    }
+
+    private static bool CommitCraftQueue(XUiC_CraftingWindowGroup group, Recipe recipe)
+    {
+        var reservation = pendingCraftQueue;
+        bool removalFailed = pendingCraftRemovalFailed;
+
+        if (removalFailed)
+        {
+            RestorePendingCraftItems();
+            Log.Warning(" [DrokkStorage] Craft cancelled because nearby materials changed before removal completed.");
+            ClearPendingCraftQueue();
+            return false;
+        }
+
+        if (reservation == null || reservation.Group != group || reservation.Recipe != recipe)
+        {
+            Log.Warning(" [DrokkStorage] Craft queue reservation was lost before material removal completed.");
+            RestorePendingCraftItems();
+            ClearPendingCraftQueue();
+            return false;
+        }
+
+        // A transpiler can fail to install, or vanilla can return without taking anything.
+        // Never create a refundable queue row unless the removal ledger proves it was paid.
+        if (DrokkStorage.config.craftFromContainersEnabled && recipe.ingredients != null)
+        {
+            foreach (var ingredient in recipe.ingredients.GroupBy(stack => stack.itemValue.type))
+            {
+                long required = ingredient.Sum(stack => (long)stack.count) * reservation.CraftCount;
+                long paid = pendingCraftRemoval?.Removed
+                    .Where(stack => stack.itemValue.type == ingredient.Key)
+                    .Sum(stack => (long)stack.count) ?? 0;
+                if (paid < required)
+                {
+                    RestorePendingCraftItems();
+                    ClearPendingCraftQueue();
+                    Log.Warning(" [DrokkStorage] Craft cancelled: ingredient removal ledger is incomplete.");
+                    return false;
+                }
+            }
+        }
+
+        // Use the explicit-count overload so the value captured before material removal is the
+        // multiplier sent to the server.  The call still goes through the existing workstation
+        // live-sync patch and publishes the row to the other viewers.
+        bool queued;
+        try
+        {
+            queued = group.AddItemToQueue(recipe, reservation.CraftCount);
+        }
+        catch
+        {
+            RestorePendingCraftItems();
+            ClearPendingCraftQueue();
+            throw;
+        }
+
+        if (!queued)
+        {
+            RestorePendingCraftItems();
+            Log.Warning(" [DrokkStorage] Craft queue commit failed; removed materials were restored.");
+        }
+
+        ClearPendingCraftQueue();
+        return queued;
+    }
+
+    private static void AbortPendingCraftQueue()
+    {
+        RestorePendingCraftItems();
+        ClearPendingCraftQueue();
+    }
+
+    private static void ClearPendingCraftQueue()
+    {
+        pendingCraftQueue = null;
+        pendingCraftRemoval = null;
+        pendingCraftRemovalFailed = false;
+        pendingCraftFreshScan = false;
+    }
+
+    private static void RestorePendingCraftItems()
+    {
+        if (pendingCraftRemoval?.Inventory == null || pendingCraftRemoval.Removed.Count == 0)
+            return;
+
+        foreach (var item in pendingCraftRemoval.Removed)
+        {
+            var copy = item.Clone();
+            if (!pendingCraftRemoval.Inventory.AddItemNoPartial(copy, false))
+                pendingCraftRemoval.Inventory.DropItem(copy);
+        }
+    }
+
+    private static void MarkPendingCraftRemovalFailed()
+    {
+        if (pendingCraftQueue != null)
+            pendingCraftRemovalFailed = true;
+    }
+
+    private static int CountCurrentSources(ItemValue item)
+    {
+        if (item == null)
+            return 0;
+
+        long total = 0;
+        foreach (var src in currentSources)
+        {
+            ItemStack[] items = src.Items;
+            if (items == null)
+                continue;
+
+            for (int j = 0; j < items.Length; j++)
+            {
+                if (items[j]?.itemValue?.type != item.type)
+                    continue;
+
+                total += Math.Max(0, items[j].count);
+                if (total >= int.MaxValue)
+                    return int.MaxValue;
+            }
+        }
+
+        return (int)total;
+    }
+
+    private static bool HasEnoughForRemoval(IList<ItemStack> stacks, int count, Func<ItemValue, int> localCount, out string missing)
+    {
+        missing = null;
+        if (!DrokkStorage.config.craftFromContainersEnabled || stacks == null || count <= 0)
+            return true;
+
+        // Refresh immediately before the removal.  ReloadStorages() is intentionally throttled for
+        // recipe UI updates, so it can return the same stale quadrant cache that hasItems() saw.
+        // A craft click is the commit boundary: pay the extra cost for one synchronous full scan
+        // so a source opened, closed, replaced, or updated by another viewer cannot be treated as
+        // available after it has disappeared.
+        if (pendingCraftQueue != null && !pendingCraftFreshScan)
+        {
+            FullRescan();
+            pendingCraftFreshScan = true;
+        }
+        else
+        {
+            ReloadStorages();
+        }
+
+        var requiredByType = new Dictionary<int, long>();
+        var valuesByType = new Dictionary<int, ItemValue>();
+        for (int i = 0; i < stacks.Count; i++)
+        {
+            var stack = stacks[i];
+            if (stack?.itemValue == null || stack.itemValue.type == 0 || stack.count <= 0)
+                continue;
+
+            long required = (long)stack.count * count;
+            if (!requiredByType.ContainsKey(stack.itemValue.type))
+            {
+                requiredByType[stack.itemValue.type] = 0;
+                valuesByType[stack.itemValue.type] = stack.itemValue;
+            }
+
+            long total = requiredByType[stack.itemValue.type] + required;
+            requiredByType[stack.itemValue.type] = total < 0 ? long.MaxValue : total;
+        }
+
+        foreach (var pair in requiredByType)
+        {
+            ItemValue item = valuesByType[pair.Key];
+            int local = Math.Max(0, localCount(item));
+            long available = (long)local + CountCurrentSources(item);
+            if (available < pair.Value)
+            {
+                missing = item.ItemClass?.GetItemName() ?? $"type {pair.Key}";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Quadrant-scanning throttle: rather than doing one full-range scan (every loaded chunk +
     // entity) in a single frame, split the area around the player into 4 quadrants and scan one
     // per tick, ~250ms apart - same overall scan rate (one full pass/second) but each tick only
@@ -1802,7 +2090,11 @@ public static class DrokkStoragePatches
         {
             var cc = clusters[i];
             if (cc == null) continue;
-            foreach (var c in cc.chunks.dict.Values.ToArray())
+            // WorldChunkCache maintains a lock-protected snapshot for this exact purpose.  Reading
+            // chunks.dict directly races the streaming thread while it adds/removes chunks; the
+            // Dictionary.ValueCollection.ToArray call then throws from CopyTo when the count changes
+            // during the copy (the workstation_forge UI exception seen in the client log).
+            foreach (var c in cc.GetChunkArrayCopySync())
             {
                 // Skip chunks outside this tick's quadrant before paying for the tile-entity
                 // dict copy below - that copy is the actual cost being amortized across ticks.
@@ -1992,22 +2284,8 @@ public static class DrokkStoragePatches
 
     private static int GetAllItemCount(ItemValue item)
     {
-        int count = 0;
         ReloadStorages();
-
-        foreach (var src in currentSources)
-        {
-            ItemStack[] items = src.Items;
-            if (items == null)
-                continue;
-
-            for (int j = 0; j < items.Length; j++)
-            {
-                if (items[j]?.itemValue?.type == item.type)
-                    count += items[j].count;
-            }
-        }
-        return count;
+        return CountCurrentSources(item);
     }
 
     // _removedItems mirrors the same parameter on every engine DecItem/RemoveItems overload: the
@@ -2018,8 +2296,26 @@ public static class DrokkStoragePatches
     // recipe ends up with zero ingredients, so cancelling a craft whose materials came out of a
     // nearby container silently destroys them. See known_bugs.md "cancelled craft ate the
     // ingredients".
-    private static int DecItem(ItemValue item, int count, IList<ItemStack> _removedItems = null)
+    private static int DecItem(ItemValue item, int count, IList<ItemStack> _removedItems = null, bool requireFull = false)
     {
+        if (requireFull)
+        {
+            // Do not consume a partial amount from storage.  RemoveItems is now guarded by a
+            // fresh availability pass; this second all-or-nothing check closes the remaining
+            // gap if a source changes between that pass and the actual decrement.
+            if (pendingCraftQueue != null && !pendingCraftFreshScan)
+            {
+                FullRescan();
+                pendingCraftFreshScan = true;
+            }
+            else if (pendingCraftQueue == null)
+            {
+                ReloadStorages();
+            }
+            if (CountCurrentSources(item) < count)
+                return 0;
+        }
+
         int numLeft = count;
         DrokkStorage.Dbgl($"DecItem: Trying to remove {count} {item.ItemClass.GetItemName()}");
 
@@ -2127,25 +2423,56 @@ public static class DrokkStoragePatches
         return numLeft;
     }
     
-    private static void DecItemForRemoveItems(IList<ItemStack> _itemStacks, int i, int numLeft, IList<ItemStack> _removedItems)
+    private static void DecItemForRemoveItems(IList<ItemStack> _itemStacks, int i, ref int numLeft, IList<ItemStack> _removedItems)
     {
         if (!DrokkStorage.config.craftFromContainersEnabled)
             return;
-        DrokkStorage.Dbgl($"DecItemForRemoveItems: Removing {numLeft} {_itemStacks[i].itemValue.ItemClass.GetItemName()}");
-        int removed = DecItem(_itemStacks[i].itemValue, numLeft, _removedItems);
 
-        // Always-on: by the time this runs the recipe is already queued (OnActivated calls
-        // AddItemToQueue before RemoveItems), so a shortfall here means the craft started without
-        // paying for it - i.e. a dupe. The count check that let it through and this removal read
-        // the same currentSources, so the only way they disagree is a source that went stale or
-        // is shadowed by an open UI between the two. Worth a log line even with Debug off.
-        if (removed < numLeft)
+        int requested = Math.Max(0, numLeft);
+        DrokkStorage.Dbgl($"DecItemForRemoveItems: Removing {requested} {_itemStacks[i].itemValue.ItemClass.GetItemName()}");
+        pendingCraftRemoval?.RecordNewItems(_removedItems);
+        int removed = DecItem(_itemStacks[i].itemValue, requested, _removedItems, requireFull: true);
+
+        // A network echo or another viewer can replace a source array between the fresh scan and
+        // the decrement.  Retry once against a newly rebuilt source list before cancelling the
+        // craft; otherwise a valid request is reported as "removed 0" and the queue operation is
+        // discarded even though the materials are still present in the nearby containers.
+        if (removed < requested)
         {
-            Log.Warning($" [DrokkStorage] Craft ingredient shortfall: needed {numLeft} more "
+            if (pendingCraftQueue != null)
+                pendingCraftFreshScan = false;
+            FullRescan();
+            if (pendingCraftQueue != null)
+                pendingCraftFreshScan = true;
+
+            int retryRequested = requested - removed;
+            if (retryRequested > 0)
+                removed += DecItem(_itemStacks[i].itemValue, retryRequested, _removedItems, requireFull: true);
+        }
+        pendingCraftRemoval?.RecordNewItems(_removedItems);
+        // RemoveItems has already consumed the local inventory portion.  Carry the storage result
+        // back into the same local that tracks the remaining amount so later branches see the
+        // exact unpaid remainder.
+        numLeft -= removed;
+
+        // A queued craft now commits only after every RemoveItems call returns.  A shortfall marks
+        // that transaction as failed, so the queue row is never created and the partial pull cannot
+        // turn into an unpaid craft.
+        if (removed < requested)
+        {
+            MarkPendingCraftRemovalFailed();
+            Log.Warning($" [DrokkStorage] Craft ingredient removal shortfall: needed {requested} more "
                 + $"{_itemStacks[i].itemValue.ItemClass.GetItemName()} from nearby storage but only removed "
-                + $"{removed}. The craft was already queued - this is an unpaid craft. "
+                + $"{removed}; the craft will be cancelled. "
                 + $"Sources scanned: {currentSources.Count}");
         }
+    }
+
+    private static int DecItemForToolbeltAndGetRemaining(Inventory inventory, ItemValue item, int count,
+        bool modded, IList<ItemStack> _removedItems)
+    {
+        int removed = inventory.DecItem(item, count, modded, _removedItems);
+        return Math.Max(0, count - removed);
     }
     
     private static int DecItemForGetAmmoCountToReload(Inventory inv, ItemValue item, int count, bool modded, IList<ItemStack> _removedItems)
@@ -2619,6 +2946,118 @@ public static class DrokkStoragePatches
             return codes.AsEnumerable();
         }
     }
+
+    // Vanilla ItemActionEntryCraft.OnActivated adds the recipe to the queue and only then calls
+    // RemoveItems.  With nearby storage that ordering allowed an availability snapshot to go
+    // stale and left a queued craft unpaid.  Keep the queue-capacity check at the original point,
+    // but defer the real AddItemToQueue call until both removal branches have completed.
+    [HarmonyPatch(typeof(ItemActionEntryCraft), nameof(ItemActionEntryCraft.OnActivated))]
+    public static class ItemActionEntryCraft_OnActivated_QueueReservation_Patch
+    {
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var codes = instructions.ToList();
+            var queueMethod = AccessTools.Method(typeof(XUiC_CraftingWindowGroup), nameof(XUiC_CraftingWindowGroup.AddItemToQueue), new[] { typeof(Recipe) });
+            var prepareMethod = AccessTools.Method(typeof(DrokkStoragePatches), "PrepareCraftQueue");
+            var commitMethod = AccessTools.Method(typeof(DrokkStoragePatches), "CommitCraftQueue");
+            var inventoryRemove = AccessTools.Method(typeof(XUiM_PlayerInventory), nameof(XUiM_PlayerInventory.RemoveItems));
+            var workstationRemove = AccessTools.Method(typeof(XUiC_WorkstationInputGrid), nameof(XUiC_WorkstationInputGrid.RemoveItems));
+
+            var queueCalls = new List<int>();
+            for (int i = 0; i < codes.Count; i++)
+            {
+                if ((codes[i].opcode == OpCodes.Call || codes[i].opcode == OpCodes.Callvirt)
+                    && codes[i].operand is MethodInfo method && method == queueMethod)
+                {
+                    queueCalls.Add(i);
+                }
+            }
+
+            // The first call is the no-ingredient path.  The second is the normal path followed by
+            // workstation/inventory removal; only that second call is safe to defer.
+            if (queueCalls.Count != 2)
+            {
+                LogPatchResult("ItemActionEntryCraft.OnActivated queue transaction", 0);
+                return codes.AsEnumerable();
+            }
+
+            int mainCall = queueCalls[1];
+            if (mainCall < 2 || mainCall + 1 >= codes.Count
+                || (codes[mainCall + 1].opcode != OpCodes.Brfalse
+                    && codes[mainCall + 1].opcode != OpCodes.Brfalse_S))
+            {
+                LogPatchResult("ItemActionEntryCraft.OnActivated queue transaction", 0);
+                return codes.AsEnumerable();
+            }
+
+            object queueFailureTarget = codes[mainCall + 1].operand;
+            var groupLoad = codes[mainCall - 2].Clone();
+            var recipeLoad = codes[mainCall - 1].Clone();
+            codes[mainCall].opcode = OpCodes.Call;
+            codes[mainCall].operand = prepareMethod;
+
+            // There are two mutually exclusive removal branches in the current game build.  The
+            // workstation branch jumps over the player-inventory branch, so inserting only after
+            // the last call would leave workstation crafts with their ingredients removed but no
+            // queue row committed.  Commit immediately after every removal call; only one branch
+            // can execute for a given craft, and each branch now has the same transaction boundary.
+            var removalCalls = new List<int>();
+            for (int i = mainCall + 1; i < codes.Count; i++)
+            {
+                if ((codes[i].opcode == OpCodes.Call || codes[i].opcode == OpCodes.Callvirt)
+                    && codes[i].operand is MethodInfo method
+                    && (method == inventoryRemove || method == workstationRemove))
+                {
+                    removalCalls.Add(i);
+                }
+            }
+
+            if (removalCalls.Count == 0)
+            {
+                LogPatchResult("ItemActionEntryCraft.OnActivated queue transaction", 0);
+                return codes.AsEnumerable();
+            }
+
+            // Insert from the end so the instruction indexes collected above stay valid.  Clone
+            // the local loads because each CodeInstruction instance may only occur once in the
+            // generated stream.
+            for (int i = removalCalls.Count - 1; i >= 0; i--)
+            {
+                int insertAt = removalCalls[i] + 1;
+                codes.InsertRange(insertAt, new[]
+                {
+                    groupLoad.Clone(),
+                    recipeLoad.Clone(),
+                    new CodeInstruction(OpCodes.Call, commitMethod),
+                    new CodeInstruction(OpCodes.Brfalse, queueFailureTarget)
+                });
+            }
+
+            LogPatchResult("ItemActionEntryCraft.OnActivated queue transaction", 1);
+            return codes.AsEnumerable();
+        }
+
+        public static Exception Finalizer(Exception __exception)
+        {
+            if (__exception != null)
+                DrokkStoragePatches.AbortPendingCraftQueue();
+            return __exception;
+        }
+
+        public static void Postfix()
+        {
+            // Keep the transaction atomic if a future game build adds another early return or
+            // changes the removal branch layout without matching the transpiler's insertion
+            // points.  A committed queue always clears this state first; reaching the postfix with
+            // a reservation still alive means ingredients may already have been pulled and must be
+            // returned instead of silently disappearing.
+            if (pendingCraftQueue != null)
+            {
+                Log.Warning(" [DrokkStorage] Craft transaction did not reach queue commit; removed materials were restored.");
+                DrokkStoragePatches.AbortPendingCraftQueue();
+            }
+        }
+    }
     
     [HarmonyPatch(typeof(XUiM_PlayerInventory), nameof(XUiM_PlayerInventory.CanSwapItems))]
     public static class XUiM_PlayerInventory_CanSwapItems_Patch
@@ -2670,29 +3109,78 @@ public static class DrokkStoragePatches
     [HarmonyPatch(typeof(XUiM_PlayerInventory), nameof(XUiM_PlayerInventory.RemoveItems))]
     public static class XUiM_PlayerInventory_RemoveItems_Patch
     {
+        public static bool Prefix(XUiM_PlayerInventory __instance, IList<ItemStack> __0, int __1, IList<ItemStack> __2)
+        {
+            if (pendingCraftQueue == null || !DrokkStorage.config.craftFromContainersEnabled)
+                return true;
+
+            pendingCraftRemoval?.Register(__2, __instance);
+
+            if (!HasEnoughForRemoval(__0, __1, item => __instance.GetItemCount(item), out string missing))
+            {
+                MarkPendingCraftRemovalFailed();
+                Log.Warning($" [DrokkStorage] Craft cancelled: {missing ?? "nearby material"} changed before inventory removal.");
+                return false;
+            }
+
+            return true;
+        }
+
+        public static void Postfix(IList<ItemStack> __2)
+        {
+            // The vanilla method appends backpack and toolbelt removals to the same list after the
+            // storage fallback runs.  Capture those late entries too so a queue failure can refund
+            // every source, not only the nearby containers.
+            pendingCraftRemoval?.RecordNewItems(__2);
+        }
+
         public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
         {
             var codes = new List<CodeInstruction>(instructions);
-            int patched = 0;
+            var decItem = AccessTools.Method(typeof(Inventory), nameof(Inventory.DecItem));
+            var toolbeltRemaining = AccessTools.Method(typeof(DrokkStoragePatches), nameof(DecItemForToolbeltAndGetRemaining));
+            var decCalls = new List<int>();
             for (int i = 0; i < codes.Count; i++)
             {
-                if (codes[i].opcode == OpCodes.Callvirt && (MethodInfo)codes[i].operand == AccessTools.Method(typeof(Inventory), nameof(Inventory.DecItem)))
+                if (codes[i].opcode == OpCodes.Callvirt && (MethodInfo)codes[i].operand == decItem)
                 {
-                    var ci = codes[i + 3];
-                    var ciNew = new CodeInstruction(OpCodes.Ldarg_1);
-                    ci.MoveLabelsTo(ciNew);
-                    // Each Insert at the same index pushes the previous one back, so these read
-                    // bottom-up: ldarg.1 (_itemStacks), ldloc.0 (i), ldloc.1 (numLeft),
-                    // ldarg.3 (_removedItems), call.
-                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(DrokkStoragePatches), nameof(DecItemForRemoveItems))));
-                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldarg_3));
-                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_1));
-                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_0));
-                    codes.Insert(i + 3, ciNew);
-                    patched++;
-                    break;
+                    decCalls.Add(i);
                 }
             }
+
+            // Bag.DecItem is the backpack call; there is exactly ONE Inventory.DecItem call.
+            // Vanilla removes from backpack first and toolbelt second, then discards the toolbelt
+            // return value.  Storage fallback must run after both local inventories so a partial
+            // toolbelt amount is accounted for instead of being consumed twice or preventing a
+            // valid mixed local/storage payment.
+            if (decCalls.Count != 1 || decCalls[decCalls.Count - 1] + 1 >= codes.Count
+                || codes[decCalls[decCalls.Count - 1] + 1].opcode != OpCodes.Pop)
+            {
+                LogPatchResult("XUiM_PlayerInventory.RemoveItems", 0);
+                return codes.AsEnumerable();
+            }
+
+            int toolbeltCall = decCalls[decCalls.Count - 1];
+            codes[toolbeltCall].opcode = OpCodes.Call;
+            codes[toolbeltCall].operand = toolbeltRemaining;
+
+            var pop = codes[toolbeltCall + 1];
+            var storeRemaining = new CodeInstruction(OpCodes.Stloc_1);
+            pop.MoveLabelsTo(storeRemaining);
+            codes[toolbeltCall + 1] = storeRemaining;
+
+            int insertAt = toolbeltCall + 2;
+            var next = codes[insertAt];
+            var firstLoad = new CodeInstruction(OpCodes.Ldarg_1);
+            next.MoveLabelsTo(firstLoad);
+            // Insertions at the same index are emitted bottom-up: _itemStacks, i, ref numLeft,
+            // _removedItems, then the storage fallback call.
+            codes.Insert(insertAt, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(DrokkStoragePatches), nameof(DecItemForRemoveItems))));
+            codes.Insert(insertAt, new CodeInstruction(OpCodes.Ldarg_3));
+            codes.Insert(insertAt, new CodeInstruction(OpCodes.Ldloca_S, (byte)1));
+            codes.Insert(insertAt, new CodeInstruction(OpCodes.Ldloc_0));
+            codes.Insert(insertAt, firstLoad);
+            int patched = 1;
             LogPatchResult("XUiM_PlayerInventory.RemoveItems", patched);
             return codes.AsEnumerable();
         }
@@ -2711,6 +3199,28 @@ public static class DrokkStoragePatches
     [HarmonyPatch(typeof(XUiC_WorkstationInputGrid), nameof(XUiC_WorkstationInputGrid.RemoveItems))]
     public static class XUiC_WorkstationInputGrid_RemoveItems_Patch
     {
+        public static bool Prefix(XUiC_WorkstationInputGrid __instance, IList<ItemStack> __0, int __1, IList<ItemStack> __2)
+        {
+            if (pendingCraftQueue == null || !DrokkStorage.config.craftFromContainersEnabled)
+                return true;
+
+            pendingCraftRemoval?.Register(__2, __instance.xui?.PlayerInventory);
+
+            if (!HasEnoughForRemoval(__0, __1, item => __instance.GetItemCount(item), out string missing))
+            {
+                MarkPendingCraftRemovalFailed();
+                Log.Warning($" [DrokkStorage] Craft cancelled: {missing ?? "nearby material"} changed before workstation removal.");
+                return false;
+            }
+
+            return true;
+        }
+
+        public static void Postfix(IList<ItemStack> __2)
+        {
+            pendingCraftRemoval?.RecordNewItems(__2);
+        }
+
         public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
         {
             var codes = new List<CodeInstruction>(instructions);
@@ -2726,7 +3236,7 @@ public static class DrokkStoragePatches
                     // ldarg.3 is this overload's _removedItems too.
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(DrokkStoragePatches), nameof(DecItemForRemoveItems))));
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldarg_3));
-                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_1));
+                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloca_S, (byte)1));
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_0));
                     codes.Insert(i + 3, ciNew);
                     patched++;

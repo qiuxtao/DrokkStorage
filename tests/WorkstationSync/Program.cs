@@ -40,6 +40,12 @@ internal static class Program
 
     private static bool SkipRender() => false;
 
+    private static bool SuppressPatchLog(string __0, int __1)
+    {
+        Assert(__1 > 0, "transpiler injection installed: " + __0);
+        return false;
+    }
+
     private static void ObserveRefresh(TileEntityWorkstation te) =>
         refreshAccessing = te.IsUserAccessing();
 
@@ -56,6 +62,8 @@ internal static class Program
             prefix: new HarmonyMethod(typeof(Program), nameof(SkipRender)));
         harmony.Patch(AccessTools.Method(typeof(DrokkStoragePatches.WorkstationLiveSync), "RefreshFromTileEntity"),
             prefix: new HarmonyMethod(typeof(Program), nameof(ObserveRefresh)));
+        harmony.Patch(AccessTools.Method(typeof(DrokkStoragePatches), "LogPatchResult"),
+            prefix: new HarmonyMethod(typeof(Program), nameof(SuppressPatchLog)));
         foreach (Type type in new[]
         {
             typeof(DrokkStoragePatches.TileEntityWorkstation_read_Patch),
@@ -67,7 +75,10 @@ internal static class Program
             typeof(DrokkStoragePatches.XUiM_Workstation_SetRecipeQueueItems_Patch),
             typeof(DrokkStoragePatches.XUiC_CraftingQueue_AddRecipeToCraft_Patch),
             typeof(DrokkStoragePatches.XUiC_CraftingQueue_AddItemToRepair_Patch),
-            typeof(DrokkStoragePatches.XUiC_RecipeStack_HandleOnPress_Patch)
+            typeof(DrokkStoragePatches.XUiC_RecipeStack_HandleOnPress_Patch),
+            typeof(DrokkStoragePatches.ItemActionEntryCraft_OnActivated_QueueReservation_Patch),
+            typeof(DrokkStoragePatches.XUiM_PlayerInventory_RemoveItems_Patch),
+            typeof(DrokkStoragePatches.XUiC_WorkstationInputGrid_RemoveItems_Patch)
         })
         {
             harmony.CreateClassProcessor(type).Patch();
@@ -91,7 +102,25 @@ internal static class Program
         QueueUiCases(harmony);
         FuelButtonCases(harmony);
         SmoothCountdownCases();
+        RemovalLedgerCases();
         Console.WriteLine($"ALL PASS: {assertions} assertions; mod={modPath}; SHA256={Convert.ToHexString(actualHash)}; Harmony={typeof(Harmony).Assembly.GetName().Version}");
+    }
+
+    private static void RemovalLedgerCases()
+    {
+        var type = typeof(DrokkStoragePatches).GetNestedType("CraftRemovalTransaction", BindingFlags.NonPublic);
+        var ledger = Activator.CreateInstance(type, nonPublic: true);
+        var record = type.GetMethod("RecordNewItems");
+        var value = new ItemValue(0, false);
+        value.type = 1;
+        var first = new ItemStack(value, 1);
+        var second = new ItemStack(value.Clone(), 1);
+        var list = new List<ItemStack> { first, second };
+        record.Invoke(ledger, new object[] { list, false });
+        var removed = (List<ItemStack>)type.GetField("Removed").GetValue(ledger);
+        Assert(removed.Sum(stack => stack.count) == 2, "equal independent pulls both count toward payment/refund");
+        record.Invoke(ledger, new object[] { list, false });
+        Assert(removed.Sum(stack => stack.count) == 2, "re-reading the same removal records cannot double-refund");
     }
 
     private static TileEntityWorkstation NewWorkstation(bool accessing, bool waiting)
