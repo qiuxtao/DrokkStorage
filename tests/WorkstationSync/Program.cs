@@ -73,6 +73,7 @@ internal static class Program
             typeof(DrokkStoragePatches.XUiC_WorkstationFuelGrid_Update_Patch),
             typeof(DrokkStoragePatches.XUiC_RecipeStack_Update_Patch),
             typeof(SharedCountdownDisplay.TimerTextPatch),
+            typeof(InventoryUnloadGuard),
             typeof(DrokkStoragePatches.XUiM_Workstation_SetRecipeQueueItems_Patch),
             typeof(DrokkStoragePatches.XUiC_CraftingQueue_AddRecipeToCraft_Patch),
             typeof(DrokkStoragePatches.XUiC_CraftingQueue_AddItemToRepair_Patch),
@@ -106,6 +107,7 @@ internal static class Program
         QueueRefreshContinuityCases(harmony);
         BatchLabelCases();
         RenderedBatchLabelCases(harmony);
+        InventoryUnloadCases();
         RemovalLedgerCases();
         AutoIgnitionCases(harmony);
         OcbCompatibilityCases();
@@ -574,6 +576,22 @@ internal static class Program
         finally { DrokkStoragePatches.WorkstationLiveSync.WindowClosed(window); }
         Console.WriteLine("PASS: received fuel enables/disables button, remaining burn time and remote on/off control state");
     }
+    private static void InventoryUnloadCases()
+    {
+        var model = (XUiM_PlayerInventory)RuntimeHelpers.GetUninitializedObject(typeof(XUiM_PlayerInventory));
+        Assert(model.GetToolbeltItemStacks().Length == 0, "UI tolerates missing toolbelt during unload");
+        var inventory = (Inventory)RuntimeHelpers.GetUninitializedObject(typeof(Inventory));
+        AccessTools.Field(typeof(XUiM_PlayerInventory), "toolbelt").SetValue(model, inventory);
+        Assert(model.GetToolbeltItemStacks().Length == 0, "actual getter tolerates cleaned-up null slots");
+        var entry = (ItemInventoryData)RuntimeHelpers.GetUninitializedObject(typeof(ItemInventoryData));
+        entry.itemStack = new ItemStack(new ItemValue(0, false), 0);
+        AccessTools.Field(typeof(Inventory), "slots").SetValue(inventory, new[] { entry });
+        var actual = model.GetToolbeltItemStacks();
+        Assert(actual.Length == 1 && ReferenceEquals(actual[0], entry.itemStack), "normal UI getter preserves original slots and item identity");
+        AccessTools.Field(typeof(Inventory), "slots").SetValue(inventory, null);
+        Assert(model.GetToolbeltItemStacks().Length == 0, "same model safely handles slots being cleared after gameplay");
+    }
+
     private static float labelTime;
     private static string capturedLabel;
     private static bool CaptureLabel(string __0) { capturedLabel = __0; return false; }
